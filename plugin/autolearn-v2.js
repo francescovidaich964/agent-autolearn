@@ -122,7 +122,7 @@ export default {
         core.runReviewSubprocess({
           reviewMd,
           title: "autolearn review",
-          cwd: directory,
+          cwd: core.reviewerCwd(),
           // Pin the wrapper to the v2 binary so reviews run on the same
           // OpenCode version that spawned them (v2 has no `session delete`
           // CLI; the wrapper uses the HTTP API for opencode2).
