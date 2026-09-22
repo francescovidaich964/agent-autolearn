@@ -97,6 +97,17 @@ export function redact(str) {
 }
 
 // @spec KS-MEM-001 (ensures directory tree exists before any operation)
+// Reviewer sessions run in a scratch directory, not the workspace: harness
+// UIs that list sessions per workspace cwd (e.g. Devin Desktop Spaces via
+// ACP session/list) would otherwise surface every review as a conversation.
+// Review content still targets the real project (absolute paths); only the
+// session's directory differs. Override with AUTOLEARN_REVIEW_CWD.
+export function reviewerCwd() {
+  const dir = process.env.AUTOLEARN_REVIEW_CWD || join(AL_HOME, "reviewer-cwd")
+  try { mkdirSync(dir, { recursive: true }) } catch {}
+  return dir
+}
+
 export function ensureStore() {
   migrateToPersonas()
   mkdirSync(DEFAULT_PERSONA_DIR, { recursive: true })
