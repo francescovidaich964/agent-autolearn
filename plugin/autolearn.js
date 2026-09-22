@@ -13,7 +13,7 @@
  *   AUTOLEARN_DEBUG    - Set to "1" for debug logging
  */
 
-import { writeFileSync } from "fs"
+import { mkdirSync, writeFileSync } from "fs"
 import { join } from "path"
 import * as core from "./autolearn-core.mjs"
 
@@ -57,7 +57,16 @@ export const AutolearnPlugin = async (ctx) => {
   const messageRoles = new Map()
 
   const projectName = () => (directory || worktree || process.cwd()).split("/").pop() || "unknown"
-  const reviewCwd = () => directory || worktree || process.cwd()
+  // Reviewer sessions run in a scratch directory, not the workspace: harness
+  // UIs that list sessions per workspace cwd (e.g. Devin Desktop Spaces via
+  // ACP session/list) would otherwise surface every review as a conversation.
+  // Review content still targets the real project (absolute paths); only the
+  // session's directory differs. Override with AUTOLEARN_REVIEW_CWD.
+  const reviewCwd = () => {
+    const dir = process.env.AUTOLEARN_REVIEW_CWD || join(core.AL_HOME, "reviewer-cwd")
+    try { mkdirSync(dir, { recursive: true }) } catch {}
+    return dir
+  }
 
   core.injectInstructions()
   core.composeContext()
