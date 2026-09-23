@@ -13,9 +13,20 @@
  *   AUTOLEARN_DEBUG    - Set to "1" for debug logging
  */
 
-import { mkdirSync, writeFileSync } from "fs"
+import { mkdirSync, readFileSync, writeFileSync } from "fs"
 import { join } from "path"
 import * as core from "./autolearn-core.mjs"
+
+// Activity-coupled curator trigger: after a successful review spawn, if the
+// curator has never run or curator_interval_days (config.yaml, default 7)
+// have elapsed, spawn a curator session. Time-only criterion by design
+// (2026-09-23); revisit a skills-count pressure valve if the library grows.
+// The marker file throttles repeated triggers while a run is in flight or
+// failing.
+const CURATOR_PROMPT = "Load the autolearn skill and follow references/curator.md to run the curator."
+const CURATOR_TRIGGER_COOLDOWN_MS = 6 * 60 * 60 * 1000
+const CURATOR_STATE_FILE = join(core.DEFAULT_PERSONA_DIR, ".curator_state.json")
+const CURATOR_TRIGGER_MARKER = join(core.AL_HOME, ".curator_trigger")
 
 // @spec CM-GUARD-001
 export const AutolearnPlugin = async (ctx) => {
@@ -68,6 +79,40 @@ export const AutolearnPlugin = async (ctx) => {
     return dir
   }
 
+  // @spec (local) activity-coupled curator trigger — see constants above.
+  function curatorDue() {
+    try {
+      const cfg = core.parseConfig()
+      const days = Number(cfg.curator_interval_days) || 7
+      let lastRunMs = null
+      try {
+        const st = JSON.parse(readFileSync(CURATOR_STATE_FILE, "utf-8"))
+        if (st.last_run) lastRunMs = new Date(st.last_run).getTime()
+      } catch {}
+      if (!lastRunMs) return true
+      return Date.now() - lastRunMs >= days * 86400000
+    } catch (err) {
+      core.dbg("CURATOR DUE CHECK FAILED", err.message)
+      return false
+    }
+  }
+
+  function maybeTriggerCurator() {
+    try {
+      if (!curatorDue()) return
+      try {
+        const prev = Number(readFileSync(CURATOR_TRIGGER_MARKER, "utf-8")) || 0
+        if (Date.now() - prev < CURATOR_TRIGGER_COOLDOWN_MS) return
+      } catch {}
+      writeFileSync(CURATOR_TRIGGER_MARKER, String(Date.now()))
+      core.runCuratorSubprocess({ prompt: CURATOR_PROMPT, cwd: reviewCwd() })
+      core.logObs({ type: "curator_triggered" })
+      core.dbg("CURATOR TRIGGERED")
+    } catch (err) {
+      core.dbg("CURATOR TRIGGER FAILED", err.message)
+    }
+  }
+
   core.injectInstructions()
   core.composeContext()
 
@@ -104,7 +149,7 @@ export const AutolearnPlugin = async (ctx) => {
     core.dbg("SPAWN REVIEW", captured.length, "messages, trigger", trigger)
 
     try {
-      core.runReviewSubprocess({
+      const res = core.runReviewSubprocess({
         reviewMd,
         title: "autolearn review",
         cwd: reviewCwd(),
@@ -113,6 +158,7 @@ export const AutolearnPlugin = async (ctx) => {
         project: projectName(),
         trigger,
       })
+      if (res && res.ok) maybeTriggerCurator()
 
       // @spec CM-RS-014
       core.cleanStaleReviews(config)

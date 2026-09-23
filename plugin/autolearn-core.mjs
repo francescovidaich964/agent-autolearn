@@ -239,6 +239,10 @@ fi
 # Convert ms -> seconds for the shell arithmetic.
 MIN_INTERVAL_S=\$(( MIN_INTERVAL / 1000 ))
 NOW=\$(date +%s)
+# Curator spawns (AUTOLEARN_SKIP_GATES=1) bypass the review gates: they are
+# driven by the plugin's own due check and must not contend with a running
+# review for the gate lock or the start-to-start interval.
+if [ "\${AUTOLEARN_SKIP_GATES:-}" != "1" ]; then
 # Gate 3 first (cheap, no state change): identical conversation → skip.
 # NOTE: the plugin passes the review markdown CONTENT as \$1 (it becomes the
 # prompt), not a file path.
@@ -274,6 +278,7 @@ trap 'rm -rf "\$GATE" 2>/dev/null' EXIT
 # Record start BEFORE running so a killed review still consumes the interval
 # (fail-safe: a broken binary must not cause an endless retry loop).
 printf '%s:%s\\n' "\$NOW" "\$HASH" > "\$LOCK" 2>/dev/null
+fi
 OC="\${AUTOLEARN_HARNESS_BIN:-\${AUTOLEARN_OPENCODE_BIN:-}}"
 if [ -z "\$OC" ]; then
   if command -v pi >/dev/null 2>&1; then OC=pi
@@ -635,4 +640,22 @@ export function runReviewSubprocess({ reviewMd, filePrefix = "review", title, cw
   // Note: sync push happens in the wrapper script AFTER the review
   // completes, not here — otherwise we'd push pre-review state.
   return { ok: true, reviewFile, reviewMd }
+}
+
+/**
+ * Spawn a curator subprocess via the wrapper script (activity-coupled
+ * curator trigger). Curator spawns skip the review gates
+ * (AUTOLEARN_SKIP_GATES=1): they are driven by the plugin's own due check
+ * and must not contend with a running review for the gate lock or the
+ * start-to-start interval. The wrapper still handles harness binary
+ * selection, session cleanup and the sync push. Fire and forget.
+ */
+export function runCuratorSubprocess({ prompt, cwd, title = "autolearn curator" }) {
+  const args = [prompt, "--agent", "autolearn-reviewer", "--title", title]
+  const shellCmd = process.platform === "win32" ? [findGitBash(), WRAPPER_SCRIPT, ...args] : [WRAPPER_SCRIPT, ...args]
+  spawnDetached(shellCmd, {
+    cwd: cwd || process.cwd(),
+    env: { ...process.env, AUTOLEARN_REVIEWER: "1", AUTOLEARN_SKIP_GATES: "1", AUTOLEARN_OPENCODE_BIN: "opencode" },
+  })
+  dbg("CURATOR SPAWNED via wrapper")
 }

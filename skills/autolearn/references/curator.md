@@ -70,6 +70,11 @@ Curator report:
 
 ## Scheduling
 
+Activity-coupled trigger (OpenCode v1 shell): the plugin spawns the curator
+automatically after a review when `curator_interval_days` has elapsed since
+the last run — no external scheduler required. External scheduling remains
+supported for other harnesses.
+
 Weekly cron example (OpenCode scheduler):
 
 ```bash
