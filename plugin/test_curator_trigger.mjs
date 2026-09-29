@@ -204,6 +204,25 @@ ok(afterFirstReview > before + 2, "first review invoked the harness")
 r = spawnWrapper([reviewFileD2, "--agent", "autolearn-reviewer", "--title", "t"], { env, encoding: "utf-8", timeout: 15000 })
 ok(r.status === 0 && fakeLines().length === afterFirstReview, "second immediate review blocked by min_interval_ms (gate intact)")
 
+// The default must apply even when config.yaml omits min_interval_ms (older
+// or edited configs): the wrapper gate falls back to MIN_INTERVAL_MS, not 0.
+const cfgD = join(HOME, "personas", "default", "config.yaml")
+const cfgOrigD = readFileSync(cfgD, "utf-8")
+writeFileSync(cfgD, cfgOrigD.replace(/min_interval_ms: \d+\n/, ""))
+const reviewFileD3 = join(HOME, "review-d3.md")
+const reviewFileD4 = join(HOME, "review-d4.md")
+writeFileSync(reviewFileD3, "Review content D3 key-less\n")
+writeFileSync(reviewFileD4, "Review content D4 different\n")
+rmSync(join(HOME, ".last_wrapper_review"), { force: true })
+rmSync(join(HOME, ".review_gate"), { force: true, recursive: true })
+r = spawnWrapper([reviewFileD3, "--agent", "autolearn-reviewer", "--title", "t"], { env, encoding: "utf-8", timeout: 15000 })
+ok(r.status === 0, "key-less config: first review exits 0")
+const afterD3 = fakeLines().length
+ok(afterD3 > afterFirstReview, "key-less config: first review still runs")
+r = spawnWrapper([reviewFileD4, "--agent", "autolearn-reviewer", "--title", "t"], { env, encoding: "utf-8", timeout: 15000 })
+ok(r.status === 0 && fakeLines().length === afterD3, "key-less config: second immediate review blocked by the default min_interval_ms")
+writeFileSync(cfgD, cfgOrigD)
+
 // ---------------------------------------------------------------------------
 console.log("E. Full chain: runReviewSubprocess -> review spawn + curator trigger")
 
