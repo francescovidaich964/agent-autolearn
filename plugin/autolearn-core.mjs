@@ -235,7 +235,7 @@ const WRAPPER_CONTENT = `#!/bin/sh
 # independent of the plugin's .last_review_lock (so the two layers never
 # cancel each other out):
 #   1. one review executing at a time (atomic mkdir claim)
-#   2. min_interval_ms between review STARTS (default 30m, config-overridable)
+#   2. min_interval_ms between review STARTS (default 3 min, config-overridable)
 #   3. an identical conversation section never runs twice
 # ensureWrapper() rewrites this file on every plugin load, so a manual triage
 # edit to the wrapper no longer silently reverts (2026-09-04: the un-gated
@@ -253,7 +253,7 @@ if [ -f "\$CFG" ]; then
   case "\$MI" in ''|*[!0-9]*) ;; *) MIN_INTERVAL="\$MI" ;; esac
 fi
 # Convert ms -> seconds for the shell arithmetic.
-MIN_INTERVAL_S=\$(( MIN_INTERVAL / 1000 ))
+MIN_INTERVAL_S=\$(( \${MIN_INTERVAL:-\$MIN_INTERVAL_MS} / 1000 ))
 NOW=\$(date +%s)
 # ---- Curator mode (activity-coupled trigger, issue #23) ----
 # Invoked as: review-runner.sh --curator
@@ -581,7 +581,7 @@ export function cleanStaleReviews(config) {
  *      the identical conversation snapshot (e.g. the same idle moment seen
  *      by every instance of the same event stream) never reviews twice.
  *   2. Global spacing (all projects): min_interval_ms between any two
- *      reviews (default 30 min). Prevents the N-project parallel burst.
+ *      reviews (default 3 min). Prevents the N-project parallel burst.
  *   3. Daily cap (all projects): max_reviews_per_day reviews per calendar
  *      day, counted from review file timestamps. Default 24. Hard ceiling
  *      on provider spend even if other gates misbehave.
@@ -735,7 +735,7 @@ export function maybeSpawnCurator({ cwd, project, env, spawnFn, now = Date.now()
 // @spec CM-RS-007..CM-RS-013
 export function runReviewSubprocess({ reviewMd, filePrefix = "review", title, cwd, env, messageCount, project, trigger, log = true }) {
   // Cross-process throttle first: identical content never reviews twice, any
-  // two reviews are separated by min_interval_ms (default 30 min), and a
+  // two reviews are separated by min_interval_ms (default 3 min), and a
   // daily cap bounds total provider spend.
   // @spec CM-RS-020
   if (!throttleCheck(reviewMd)) {
