@@ -26,7 +26,7 @@ const HOME = mkdtempSync(join(tmpdir(), "al-curator-test-"))
 process.env.AUTOLEARN_HOME = HOME
 process.env.AUTOLEARN_DEBUG = "1"
 
-const { curatorDue, maybeSpawnCurator, ensureStore, runReviewSubprocess, OBS_FILE, WRAPPER_SCRIPT } = await import("./autolearn-core.mjs")
+const { curatorDue, maybeSpawnCurator, ensureStore, runReviewSubprocess, wrapperCommand, OBS_FILE, WRAPPER_SCRIPT } = await import("./autolearn-core.mjs")
 
 // Create the store (persona dirs, default config, wrapper) up front — the
 // shells call this at startup, and logObs needs the persona dir to exist.
@@ -98,8 +98,8 @@ ok(r1.ok === false && spawned.length === 0, "not due -> nothing spawned")
 writeFileSync(stateFile, JSON.stringify({ last_run: "2026-09-01" })) // 26 days before NOW -> due, and observable
 const r2 = maybeSpawnCurator({ project: "proj-x", cwd: "/tmp", now: NOW, stateFile, cooldownFile, spawnFn: (cmd, opts) => spawned.push([cmd, opts]) })
 ok(r2.ok === true, "due -> spawns")
-ok(spawned.length === 1 && spawned[0][0][0].endsWith("review-runner.sh") && spawned[0][0][1] === "--curator", "spawns wrapper with --curator")
-ok(spawned[0][0][0] === WRAPPER_SCRIPT, "spawns the pinned WRAPPER_SCRIPT path")
+const spawnedCmd = spawned[0][0]
+ok(spawned.length === 1 && spawnedCmd[spawnedCmd.length - 2] === WRAPPER_SCRIPT && spawnedCmd[spawnedCmd.length - 1] === "--curator", "spawns wrapper with --curator (platform-aware argv)")
 ok(spawned[0][1].env.AUTOLEARN_CURATOR === "1", "spawn env carries AUTOLEARN_CURATOR=1")
 ok(spawned[0][1].cwd === "/tmp", "spawn cwd honored")
 ok(readFileSync(cooldownFile, "utf-8").trim() === String(NOW), "cooldown written at spawn time")
@@ -111,6 +111,13 @@ ok(newObs.includes('"last_run":"2026-09-01"'), "observation carries last_run whe
 // spawnFn throwing must not propagate (never break the review path)
 const r3 = maybeSpawnCurator({ project: "p", now: NOW + 7200000, stateFile, cooldownFile: join(HOME, "cd2"), spawnFn: () => { throw new Error("boom") } })
 ok(r3.ok === false && r3.reason === "error", "spawn failure contained (ok:false, reason:error)")
+
+// wrapperCommand(): win32 routes the POSIX wrapper through Git Bash; other
+// platforms spawn the wrapper directly.
+const cmdWin = wrapperCommand(["--curator"], "win32")
+ok(cmdWin.length === 3 && cmdWin[1] === WRAPPER_SCRIPT && cmdWin[2] === "--curator", "win32: wrapper argv routed via Git Bash")
+const cmdPosix = wrapperCommand(["--curator"], "linux")
+ok(cmdPosix.length === 2 && cmdPosix[0] === WRAPPER_SCRIPT && cmdPosix[1] === "--curator", "posix: wrapper argv spawned directly")
 
 // ---------------------------------------------------------------------------
 console.log("C. Wrapper --curator mode (E2E vs stubbed harness binary)")
