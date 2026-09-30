@@ -209,6 +209,12 @@ function findGitBash() {
   return "bash"
 }
 
+// The wrapper is a POSIX sh script; win32 cannot exec it directly, so route
+// it through Git Bash. Returns the argv to spawn for the given platform.
+export function wrapperCommand(args, platform = process.platform) {
+  return platform === "win32" ? [findGitBash(), WRAPPER_SCRIPT, ...args] : [WRAPPER_SCRIPT, ...args]
+}
+
 // The wrapper is harness-aware: it runs the review under the binary named by
 // AUTOLEARN_HARNESS_BIN (set by each shell: v1 pins `opencode`, v2 pins
 // `opencode2`, the pi shell pins `pi`), falling back to
@@ -220,7 +226,8 @@ const WRAPPER_CONTENT = `#!/bin/sh
 # Autolearn review runner - runs an opencode review, deletes the session,
 # then pushes the updated store via sync (if configured).
 # Works with OpenCode v1 (opencode) and v2 beta (opencode2).
-# Args: passed directly to \`<binary> run --format json\` ($1 = review md path)
+# Args: $1 = path to the review markdown file (streamed to the harness on
+# stdin); remaining args pass through to \`<binary> run --format json\`.
 #
 # Wrapper-side throttle (defense in depth): plugin instances already in
 # memory predate the in-plugin throttle and keep calling this script, so
@@ -228,7 +235,7 @@ const WRAPPER_CONTENT = `#!/bin/sh
 # independent of the plugin's .last_review_lock (so the two layers never
 # cancel each other out):
 #   1. one review executing at a time (atomic mkdir claim)
-#   2. min_interval_ms between review STARTS (default 30m, config-overridable)
+#   2. min_interval_ms between review STARTS (default 3 min, config-overridable)
 #   3. an identical conversation section never runs twice
 # ensureWrapper() rewrites this file on every plugin load, so a manual triage
 # edit to the wrapper no longer silently reverts (2026-09-04: the un-gated
@@ -246,7 +253,7 @@ if [ -f "\$CFG" ]; then
   case "\$MI" in ''|*[!0-9]*) ;; *) MIN_INTERVAL="\$MI" ;; esac
 fi
 # Convert ms -> seconds for the shell arithmetic.
-MIN_INTERVAL_S=\$(( MIN_INTERVAL / 1000 ))
+MIN_INTERVAL_S=\$(( \${MIN_INTERVAL:-\$MIN_INTERVAL_MS} / 1000 ))
 NOW=\$(date +%s)
 # ---- Curator mode (activity-coupled trigger, issue #23) ----
 # Invoked as: review-runner.sh --curator
@@ -298,10 +305,14 @@ if [ "\$1" = "--curator" ]; then
   fi
   exit 0
 fi
+# $1 is the review markdown PATH (not its content): the file is streamed to
+# the harness on stdin, keeping the command line small. Windows caps a
+# process command line at 32,767 chars; content-as-argv broke reviews over
+# ~32 KB with ENAMETOOLONG (issue #21).
+REVIEW_FILE="\$1"
+shift
 # Gate 3 first (cheap, no state change): identical conversation → skip.
-# NOTE: the plugin passes the review markdown CONTENT as \$1 (it becomes the
-# prompt), not a file path.
-CONV=\$(printf '%s' "\$1" | sed -n '/## Conversation/,\$p')
+CONV=\$(sed -n '/## Conversation/,\$p' "\$REVIEW_FILE" 2>/dev/null)
 HASH=""
 if [ -n "\$CONV" ]; then
   HASH=\$(printf '%s' "\$CONV" | md5 -q 2>/dev/null || printf '%s' "\$CONV" | md5sum | cut -d' ' -f1)
@@ -342,7 +353,7 @@ fi
 # pi branch: one-shot print-mode review, ephemeral (--no-session),
 # project-local resources ignored (-na), review md piped on stdin.
 if [ "\$(basename "\$OC")" = "pi" ]; then
-  printf '%s' "\$1" | "\$OC" -p --no-session -na >/dev/null 2>&1
+  "\$OC" -p --no-session -na < "\$REVIEW_FILE" >/dev/null 2>&1
   AL_CLI="\$HOME/.agents/skills/autolearn/scripts/autolearn.py"
   [ -f "\$AL_CLI" ] || AL_CLI="\$HOME/.agents/skills/autolearn-reviewer/scripts/autolearn.py"
   if [ -n "\${AUTOLEARN_SYNC_API_KEY:-}" ] && [ -f "\${HOME}/.autolearn/.encryption_salt" ] && [ -f "\$AL_CLI" ]; then
@@ -351,7 +362,7 @@ if [ "\$(basename "\$OC")" = "pi" ]; then
   exit 0
 fi
 OUT=\$(mktemp "\${TMPDIR:-/tmp}/alreview.XXXXXX")
-"\$OC" run --format json "\$@" > "\$OUT" 2>/dev/null
+"\$OC" run --format json "\$@" < "\$REVIEW_FILE" > "\$OUT" 2>/dev/null
 # BRE backslashes below are DOUBLED (\\\\, \\1) because this script lives
 # inside a JS template literal — single backslashes get eaten by the escape
 # evaluation (\\( -> ( , \\1 -> 0x01 control char under Bun) and the sed
@@ -570,7 +581,7 @@ export function cleanStaleReviews(config) {
  *      the identical conversation snapshot (e.g. the same idle moment seen
  *      by every instance of the same event stream) never reviews twice.
  *   2. Global spacing (all projects): min_interval_ms between any two
- *      reviews (default 30 min). Prevents the N-project parallel burst.
+ *      reviews (default 3 min). Prevents the N-project parallel burst.
  *   3. Daily cap (all projects): max_reviews_per_day reviews per calendar
  *      day, counted from review file timestamps. Default 24. Hard ceiling
  *      on provider spend even if other gates misbehave.
@@ -698,7 +709,7 @@ export function maybeSpawnCurator({ cwd, project, env, spawnFn, now = Date.now()
     // per harness family, and dropping the pin would let the wrapper's PATH
     // fallback route a v1-pinned curator to opencode2 (or pi) — the binary-
     // shadowing failure mode. AUTOLEARN_CURATOR marks the run for debugging.
-    spawn([WRAPPER_SCRIPT, "--curator"], {
+    spawn(wrapperCommand(["--curator"]), {
       cwd: cwd || process.cwd(),
       env: { ...process.env, AUTOLEARN_CURATOR: "1", ...(env || {}) },
     })
@@ -724,7 +735,7 @@ export function maybeSpawnCurator({ cwd, project, env, spawnFn, now = Date.now()
 // @spec CM-RS-007..CM-RS-013
 export function runReviewSubprocess({ reviewMd, filePrefix = "review", title, cwd, env, messageCount, project, trigger, log = true }) {
   // Cross-process throttle first: identical content never reviews twice, any
-  // two reviews are separated by min_interval_ms (default 30 min), and a
+  // two reviews are separated by min_interval_ms (default 3 min), and a
   // daily cap bounds total provider spend.
   // @spec CM-RS-020
   if (!throttleCheck(reviewMd)) {
@@ -741,9 +752,12 @@ export function runReviewSubprocess({ reviewMd, filePrefix = "review", title, cw
   dbg("REVIEW FILE WRITTEN", reviewFile)
 
   // @spec CM-RS-008, CM-RS-009, CM-RS-010
-  const args = [reviewMd, "--agent", "autolearn-reviewer", "--title", title]
-  const shellCmd = process.platform === "win32" ? [findGitBash(), WRAPPER_SCRIPT, ...args] : [WRAPPER_SCRIPT, ...args]
-  spawnDetached(shellCmd, {
+  // Pass the review FILE PATH, not the content: the wrapper streams the file
+  // to the harness on stdin. Content-as-argv exceeds the Windows command-line
+  // limit (32,767 chars) once the review passes ~32 KB and the spawn dies
+  // with ENAMETOOLONG (issue #21).
+  const args = [reviewFile, "--agent", "autolearn-reviewer", "--title", title]
+  spawnDetached(wrapperCommand(args), {
     cwd: cwd || process.cwd(),
     env: { ...process.env, AUTOLEARN_REVIEWER: "1", ...(env || {}) },
   })
