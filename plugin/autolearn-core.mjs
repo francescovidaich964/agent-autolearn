@@ -51,6 +51,11 @@ export const REVIEWS_DIR = join(DEFAULT_PERSONA_DIR, "reviews")
 export const SKILLS_DIR = join(DEFAULT_PERSONA_DIR, "skills")
 export const ARCHIVE_DIR = join(SKILLS_DIR, ".archive")
 export const WRAPPER_SCRIPT = join(BIN_DIR, "review-runner.sh")
+// win32 hidden spawn launcher (issue #32): wscript runs the command line
+// carried in SPAWN_CMD_ENV with a hidden window, preserving detached
+// semantics (env values are not parsed, so quoted paths survive exactly).
+export const LAUNCHER_SCRIPT = join(BIN_DIR, "spawn-hidden.vbs")
+export const SPAWN_CMD_ENV = "AUTOLEARN_SPAWN_CMD"
 // Activity-coupled curator trigger (issue #23). The state file is written by
 // the Python CLI (`curator run` saves last_run on EVERY run, including
 // no-transition runs); the JS side only reads it.
@@ -114,6 +119,7 @@ export function ensureStore() {
     writeFileSync(CONFIG_FILE, `review_threshold: ${THRESHOLD_DEFAULT}\nsession_review_on_idle: true\nmax_conversation_buffer: 50\nmin_interval_ms: ${MIN_INTERVAL_DEFAULT_MS}\ncurator_interval_days: 7\nstale_after_days: 30\narchive_after_days: 90\n`)
   }
   ensureWrapper()
+  ensureLauncher()
 }
 
 // Phase 3 migration: move flat ~/.autolearn/ files to personas/default/
@@ -173,23 +179,46 @@ export function syncBackground(command) {
 // host's event loop alive (e.g. memory compose).
 export function spawnDetached(cmd, opts = {}) {
   const { unref, ...spawnOpts } = opts
+  let argv = cmd
+  let env = spawnOpts.env || { ...process.env }
+  // win32: `detached: true` (DETACHED_PROCESS) makes the child auto-allocate
+  // a VISIBLE console window, and windowsHide cannot stop it (CREATE_NO_WINDOW
+  // is ignored when DETACHED_PROCESS is set — issue #32). Route the spawn
+  // through a hidden launcher instead; fall back to the direct spawn (with a
+  // window) if the launcher cannot be installed.
+  if (process.platform === "win32") {
+    try {
+      // Self-heal: ensureStore() writes the launcher at plugin load, but a
+      // spawn must never silently no-op when it is missing (stale install,
+      // manual delete, first spawn before load).
+      if (!existsSync(LAUNCHER_SCRIPT)) ensureLauncher()
+      if (!existsSync(LAUNCHER_SCRIPT)) throw new Error("launcher unavailable: " + LAUNCHER_SCRIPT)
+      // The command line travels in an env var: values are not parsed, so
+      // quoted paths survive exactly (wscript argv cannot round-trip them)
+      // and concurrent spawns cannot collide.
+      env = { ...env, [SPAWN_CMD_ENV]: winCommandLine(cmd) }
+      argv = hiddenSpawnCommand()
+    } catch (err) {
+      dbg("hidden spawn setup failed, spawning directly:", err.message)
+    }
+  }
   if (typeof Bun !== "undefined" && typeof Bun.spawn === "function") {
-    const proc = Bun.spawn(cmd, {
+    const proc = Bun.spawn(argv, {
       stdout: "ignore",
       stderr: "ignore",
       stdin: "ignore",
       detached: true,
       ...spawnOpts,
-      env: spawnOpts.env || { ...process.env },
+      env,
     })
     try { unref ? proc.unref() : proc.ref() } catch {}
     return proc
   }
-  const proc = nodeSpawn(cmd[0], cmd.slice(1), {
+  const proc = nodeSpawn(argv[0], argv.slice(1), {
     stdio: "ignore",
     detached: true,
     ...spawnOpts,
-    env: spawnOpts.env || { ...process.env },
+    env,
   })
   try { proc.unref() } catch {}
   return proc
@@ -400,6 +429,80 @@ function ensureWrapper() {
   } catch (err) {
     dbg("ensureWrapper failed:", err.message)
   }
+}
+
+// ---------------------------------------------------------------------------
+// win32 hidden spawn launcher (issue #32).
+//
+// libuv maps `detached: true` to DETACHED_PROCESS, so a console app starts
+// with no console and auto-allocates a VISIBLE one on first console API use.
+// windowsHide cannot prevent it: CREATE_NO_WINDOW is ignored when
+// DETACHED_PROCESS is set. The only reliable way to keep detached spawns
+// windowless is a GUI-subsystem launcher: wscript.exe (no console of its
+// own) runs the command line with WshShell.Run(..., 0, False) — SW_HIDE,
+// async — and the child keeps detached survival semantics.
+const LAUNCHER_CONTENT = `Option Explicit
+' Autolearn hidden spawn launcher (win32).
+' Runs the command line from the ${SPAWN_CMD_ENV} environment variable with
+' a hidden window (style 0), without waiting. wscript.exe is a GUI-subsystem
+' host (no console of its own); the cmd /c wrap with stdin from NUL keeps the
+' old stdio:"ignore" semantics for the child (a console stdin would hang
+' stdin-reading children). See plugin/autolearn-core.mjs (issue #32).
+Dim sh, cmdLine
+Set sh = CreateObject("WScript.Shell")
+cmdLine = sh.Environment("PROCESS")("${SPAWN_CMD_ENV}")
+sh.Run "cmd /c """ & cmdLine & " <nul""", 0, False
+`
+
+export function ensureLauncher() {
+  if (process.platform !== "win32") return
+  try {
+    // Same read-only dance as ensureWrapper: a stale in-memory plugin must
+    // not be able to restore an old launcher over a fresh one.
+    try { chmodSync(LAUNCHER_SCRIPT, 0o644) } catch {}
+    writeFileSync(LAUNCHER_SCRIPT, LAUNCHER_CONTENT)
+    chmodSync(LAUNCHER_SCRIPT, 0o544)
+  } catch (err) {
+    dbg("ensureLauncher failed:", err.message)
+  }
+}
+
+// Windows command-line quoting (the CRT rule set): quote when the argument
+// contains whitespace or quotes; escape embedded quotes with backslashes;
+// double trailing backslashes before a closing quote. Port of Python's
+// subprocess.list2cmdline, which follows the same rules.
+export function winCommandLine(args) {
+  let out = ""
+  for (const arg of args) {
+    if (out) out += " "
+    if (arg === "" || /[\s"]/.test(arg)) {
+      out += '"'
+      let backslashes = 0
+      for (const ch of arg) {
+        if (ch === "\\") { backslashes++; out += ch; continue }
+        if (ch === '"') { out += "\\".repeat(backslashes + 1) + '"'; backslashes = 0; continue }
+        backslashes = 0
+        out += ch
+      }
+      out += "\\".repeat(backslashes) + '"'
+    } else {
+      out += arg
+    }
+  }
+  return out
+}
+
+function wscriptPath() {
+  const root = process.env.SystemRoot || "C:\\Windows"
+  const p = join(root, "System32", "wscript.exe")
+  try { if (existsSync(p)) return p } catch {}
+  return "wscript.exe"
+}
+
+// The argv to spawn on win32: wscript runs the hidden launcher, which reads
+// the command line from SPAWN_CMD_ENV. Exported for the platform tests.
+export function hiddenSpawnCommand({ wscript = wscriptPath(), launcher = LAUNCHER_SCRIPT } = {}) {
+  return [wscript, "//B", "//Nologo", launcher]
 }
 
 export function parseConfig() {
