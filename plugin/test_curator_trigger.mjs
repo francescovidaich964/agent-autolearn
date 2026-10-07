@@ -12,6 +12,7 @@
  *   D. Review-path regression (min_interval_ms still gates reviews)
  *   E. Full-chain integration: runReviewSubprocess fires review + curator
  *   F. Large-review regression (issue #21: >32 KB review spawns via file path + stdin)
+ *   G. Win32 hidden spawn launcher (issue #32: no visible console windows)
  *
  * All state lives under a temp AUTOLEARN_HOME; the real ~/.autolearn is
  * never touched. The module resolves its path constants from AUTOLEARN_HOME
@@ -27,7 +28,7 @@ const HOME = mkdtempSync(join(tmpdir(), "al-curator-test-"))
 process.env.AUTOLEARN_HOME = HOME
 process.env.AUTOLEARN_DEBUG = "1"
 
-const { curatorDue, maybeSpawnCurator, ensureStore, runReviewSubprocess, wrapperCommand, OBS_FILE, WRAPPER_SCRIPT } = await import("./autolearn-core.mjs")
+const { curatorDue, maybeSpawnCurator, ensureStore, runReviewSubprocess, wrapperCommand, winCommandLine, hiddenSpawnCommand, SPAWN_CMD_ENV, OBS_FILE, WRAPPER_SCRIPT, LAUNCHER_SCRIPT } = await import("./autolearn-core.mjs")
 
 // win32 cannot exec the POSIX wrapper directly (EFTYPE); route it through
 // Git Bash, mirroring the plugin's own spawn routing (ccfb8c6).
@@ -281,6 +282,29 @@ while (Date.now() < deadline && !fakeLines().slice(reviewBeforeF).some((l) => l.
   await new Promise((res2) => setTimeout(res2, 200))
 }
 ok(fakeLines().slice(reviewBeforeF).some((l) => l.includes(bigMarker)), "40 KB review content flowed to the harness on stdin")
+
+// ---------------------------------------------------------------------------
+console.log("G. win32 hidden spawn launcher (issue #32)")
+
+// Command-line quoting (CRT rules): plain args pass through; whitespace or
+// quotes trigger quoting; embedded quotes and trailing backslashes escape.
+ok(winCommandLine(["uv", "run", "/x/autolearn.py", "sync", "pull"]) === "uv run /x/autolearn.py sync pull", "quoting: plain args pass through")
+ok(winCommandLine(["C:/Program Files/Git/bin/bash.exe", "--title", "a b"]) === '"C:/Program Files/Git/bin/bash.exe" --title "a b"', "quoting: whitespace gets quotes")
+ok(winCommandLine(['say "hi"']) === '"say \\"hi\\""', "quoting: embedded quotes escape")
+ok(winCommandLine(["C:\\dir \\"]) === '"C:\\dir \\\\"', "quoting: trailing backslash before closing quote doubles")
+ok(winCommandLine([""]) === '""', "quoting: empty arg")
+
+// Launcher argv: win32 spawns wscript with the launcher script; the command
+// line itself travels in SPAWN_CMD_ENV (not parsed, so quoted paths survive).
+const wlArgv = hiddenSpawnCommand({ wscript: "C:/Windows/System32/wscript.exe", launcher: "C:/al/bin/spawn-hidden.vbs" })
+ok(wlArgv.length === 4 && wlArgv[0] === "C:/Windows/System32/wscript.exe" && wlArgv[1] === "//B" && wlArgv[2] === "//Nologo" && wlArgv[3] === "C:/al/bin/spawn-hidden.vbs", "win32: wscript launcher argv")
+
+// ensureStore installs the launcher (win32 only); it reads the command line
+// from SPAWN_CMD_ENV and runs it hidden + async with NUL stdin (the old
+// stdio:"ignore" semantics — without the redirect, children that read stdin
+// would hang instead of seeing EOF).
+const launcherOnDisk = existsSync(LAUNCHER_SCRIPT) ? readFileSync(LAUNCHER_SCRIPT, "utf-8") : ""
+ok(process.platform !== "win32" || (launcherOnDisk.includes("cmd /c") && launcherOnDisk.includes("<nul") && launcherOnDisk.includes(SPAWN_CMD_ENV)), "installed launcher reads the command line and runs it hidden with NUL stdin (win32)")
 
 // ---------------------------------------------------------------------------
 
