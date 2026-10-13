@@ -233,7 +233,10 @@ def build_message(review_text: str, skill_dir: Path, home: Path) -> str:
     proto = ("\n\n---\n\n# Appended: autolearn reviewer protocol\n\n"
              "## Shared skill reference (signal taxonomy, hard gates)\n\n" + skill_body +
              "\n\n## Reviewer mode (references/reviewer.md)\n\n" + reviewer)
-    return body + rewrite_paths(proto, skill_dir, home)
+    # The conversation itself often mentions ~/.autolearn (in the first pilot
+    # the reviewer followed such a mention to the live reviews folder), so the
+    # rewrite covers the whole message, identically for every variant.
+    return rewrite_paths(body + proto, skill_dir, home)
 
 
 def provider_subset(model: str | None) -> dict:

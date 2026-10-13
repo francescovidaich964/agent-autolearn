@@ -109,7 +109,10 @@ If you prefer to edit `~/.config/opencode/opencode.json` yourself, here is what 
 - **Review every N user messages** (default 5, `review_threshold`), counted in USER messages so a review always covers complete exchanges.
 - **Idle reviews** on session quiet (`session_review_on_idle`, 5-min cooldown), **exit reviews** at session end (buffer flush, >2 messages).
 - **Three-layer global throttle** (`plugin/autolearn-core.mjs`): identical conversation never reviews twice, `min_interval_ms` between review starts, `max_reviews_per_day` hard ceiling — plus wrapper-side gates (single-execution claim, interval, content hash) as defense in depth.
-- **One skill change per review** (create OR patch), gated by a recurrence check — single-session patterns go to the wiki pattern notebook instead.
+- **No review is silently lost**: a review the wrapper cannot run now (busy / too soon) is queued in `reviews/pending/` and drained by the current gate holder; every decision is logged to `review-runs.jsonl`.
+- **Skills are edited by the agent that used them** (`skill edit`, exact replacement). The reviewer cannot edit skills: it stages at most one action per review — a `skill propose` for a loaded skill (surfaced to the next session that loads it) or a recurrence-gated `skill create`; single-session patterns go to the wiki pattern notebook instead.
+- **Two-tier memory**: a hard-capped core injected into every session, and an archive retrieved by relevance (per-session BM25 slice on OpenCode v1). The CLI refuses near-duplicates and core overflow, so the writer curates.
+- **Store integrity**: one cross-process lock for every read-modify-write, atomic writes with Windows retry, and a write-time scan that refuses prompt-injection payloads and secrets.
 - **Reviewer recursion guards**: `AUTOLEARN_REVIEWER=1` env var, agent-name and title matching, and buffer depth guard.
 - **Skill lifecycle**: curator transitions (stale at 30 days, archived at 90, pinned exempt); archives are never deleted.
 
@@ -159,7 +162,19 @@ curator_interval_days: 7      # days between automatic curator runs (0 disables)
 stale_after_days: 30          # days before skill → stale
 archive_after_days: 90        # days before skill → archived
 escalation_threshold: 3       # reinforcement count before curator suggests promotion to AGENTS.md
+core_memory_chars: 2500       # hard cap of the always-injected core (memory entries)
+core_user_chars: 1500         # hard cap of the always-injected core (user preferences)
+core_entry_max_chars: 400     # longer entries go to the archive
+max_user_chars: 4000          # per user message in the review buffer
+max_assistant_chars: 2000     # per assistant message in the review buffer
+max_pinned_skills: 5          # pins exempt skills from lifecycle rules
+auto_apply_rewrites: false    # let the curator apply its own staged rewrites
+# reviewer_model: provider/model   # run reviews on a different (cheaper/faster) model
 ```
+
+Evaluating a design change (store health snapshots, sandboxed A/B replay of
+real reviews, blind judge): see [`eval/README.md`](eval/README.md) and
+[`docs/designs/robust-learning-loop/LLD.md`](docs/designs/robust-learning-loop/LLD.md).
 
 ## CLI reference
 
