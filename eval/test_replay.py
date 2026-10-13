@@ -108,3 +108,10 @@ def test_parse_verdict(text, ok):
 def test_prompt_truncates_long_conversations():
     p = judge.build_prompt("x" * 50000, "A changes", "B changes", 1000)
     assert "middle truncated" in p and len(p) < 6000
+
+
+def test_external_dirs_emits_native_and_posix_patterns(tmp_path):
+    rules = replay.external_dirs(tmp_path)
+    assert list(rules)[0] == "*" and rules["*"] == "deny"          # catch-all first: last match wins
+    assert rules[str(tmp_path) + replay.os.sep + "*"] == "allow"
+    assert rules[replay.posix(tmp_path) + "/*"] == "allow"

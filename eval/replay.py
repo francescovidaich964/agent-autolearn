@@ -246,17 +246,33 @@ def provider_subset(model: str | None) -> dict:
     return cfg
 
 
+def external_dirs(*dirs: Path) -> dict:
+    """external_directory rules: allow these trees, deny everything else.
+
+    OpenCode matches native paths (backslashes on Windows); forward-slash
+    patterns silently never match, which turned every read into an error in
+    the first pilot. Emit both forms. Order matters: last match wins, so the
+    catch-all deny comes first.
+    """
+    rules = {"*": "deny"}
+    for d in dirs:
+        rules[str(d) + os.sep + "*"] = "allow"
+        rules[posix(d) + "/*"] = "allow"
+    return rules
+
+
 def write_sandbox_config(xdg: Path, sb: Path, skill_dir: Path, model: str | None, agents_md: str | None) -> None:
     cfg = provider_subset(model)
     cfg["small_model"] = cfg["model"]
-    cfg["instructions"] = [posix(sb / "al" / "personas" / "default" / "memory.context.md")]
-    cfg["permission"] = {"external_directory": {posix(sb) + "/*": "allow", posix(skill_dir.parents[1]) + "/*": "allow", "*": "deny"}}
+    cfg["instructions"] = [str(sb / "al" / "personas" / "default" / "memory.context.md")]
+    allowed = external_dirs(sb, skill_dir.parents[1])
+    cfg["permission"] = {"external_directory": allowed}
     cfg["agent"] = {"autolearn-replay": {
         "description": "Replays an autolearn review in a sandbox", "hidden": True, "steps": 20,
         "prompt": REPLAY_AGENT_PROMPT,
         "permission": {"bash": "allow", "read": "allow", "glob": "allow", "grep": "allow", "write": "allow",
                        "edit": "deny", "webfetch": "deny", "task": "deny", "skill": "deny",
-                       "external_directory": {posix(sb) + "/*": "allow", posix(skill_dir.parents[1]) + "/*": "allow", "*": "deny"}},
+                       "external_directory": allowed},
     }}
     oc = xdg / "opencode"
     oc.mkdir(parents=True, exist_ok=True)

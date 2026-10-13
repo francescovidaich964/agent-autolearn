@@ -30,11 +30,12 @@ evidence make the edit, and measure every change.**
   `personas/default/review-runs.jsonl`: `skipped_duplicate`, `deferred`
   (busy or interval gate), `started`, `finished` (exit code, duration,
   step count, token totals, cost when the harness reports them),
-  `drained`, `expired`.
+  `drained`, `expired`, `lost`.
 - RL-OPS-002: A review blocked by the busy or interval gate SHALL be moved to
-  `reviews/pending/` instead of being dropped. The gate holder drains up to
-  `pending_drain_max` (default 3) pending reviews before releasing the gate.
-  Pending reviews older than 24 h are expired (logged).
+  `reviews/pending/` instead of being dropped. The gate holder drains up to 3
+  pending reviews (refreshing its claim before each) before releasing the
+  gate. Pending reviews older than 72 h are expired (logged). A throttled
+  exit review is queued by the plugin itself.
 - RL-OPS-003: The plugin's peek throttle SHALL treat a fresh wrapper gate
   (`.review_gate` younger than 15 min) as busy, so the buffer is retained and
   rides the next trigger rather than being handed to a busy wrapper.
@@ -68,25 +69,29 @@ evidence make the edit, and measure every change.**
 ### RL-MEM — Two-tier memory (Phase 2)
 
 - RL-MEM-001: Each registry record carries `layer: core | archive`. Core is
-  hard-capped per type: `core_memory_chars` (default 2200) and
-  `core_user_chars` (default 1300).
+  hard-capped per type: `core_memory_chars` (default 2500) and
+  `core_user_chars` (default 1500); a core entry is at most
+  `core_entry_max_chars` (400).
 - RL-MEM-002: `memory add` / `user add` place new entries in core. If the cap
   would be exceeded the command fails (exit 2) and prints the core entries
   with ids and usage; the writer must `memory demote <id>`,
   `memory edit <id> "<shorter>"` or `memory remove` first, or add with
   `--archive`. Nothing is silently dropped.
 - RL-MEM-003: Before adding, the CLI SHALL check near-duplicates (token
-  Jaccard over topics ≥ `dedupe_threshold`, default 0.6, or containment
-  ≥ 0.8) across core+archive; a match fails with the existing id and the
-  suggested `memory strengthen --id <id>`. `--force` overrides.
+  Jaccard over topics ≥ 0.4, or containment ≥ 0.8 with ≥ 5 tokens; calibrated
+  on the production store) across core+archive and both types; a match fails
+  with the existing id and the suggested `memory strengthen --id <id>` /
+  `memory edit`. `--force` overrides.
 - RL-MEM-004: `memory.context.md` (injected by the `instructions` entry for
   every harness) SHALL contain the core layer only (pinned first).
 - RL-MEM-005: The v1 shell SHALL add a per-session, project-relevant slice of
   the archive through `experimental.chat.system.transform`, composed once per
-  session from project name, directory segments, git remote and the first user
-  message, then frozen for the session (prefix-cache friendly). Python writes
-  `memory.archive.json` (records + ranking params) on every mutation; the JS
-  ranking mirrors `composer.relevance`.
+  session from the project name (not the home dir), the git remote and the
+  first user message, then frozen for the session (prefix-cache friendly).
+  Ranking is BM25 over the archive (min 2 shared terms, score ≥ 8,
+  ≤ 1500 chars, ≤ 6 entries), weighted by retention. Python writes
+  `memory.archive.json` (records, df/n/avgdl, params) on every mutation; the
+  JS ranking mirrors `memlayers.search` (parity-tested).
 - RL-MEM-006: `memory search "<terms>"` exposes the archive on demand.
 - RL-MEM-007: A memory MAY carry a declarative check
   `{path, pattern, expect: present|absent}` (no command execution).
@@ -102,9 +107,12 @@ evidence make the edit, and measure every change.**
   replaces exactly one occurrence (fails on 0 or >1 matches), backs up the
   previous file to `skills/.history/<name>/`, bumps `patch_count`, writes a
   ledger entry.
-- RL-SKL-002: When `AUTOLEARN_REVIEWER=1`, `skill edit|patch|rewrite` SHALL
-  refuse; the reviewer stages `skill propose <name> --old --new --reason`
-  instead. In-session agents edit skills they loaded when they turn out wrong.
+- RL-SKL-002: When `AUTOLEARN_REVIEWER=1`, `skill edit|patch|apply|
+  set-description` SHALL refuse (exit 4); the reviewer stages `skill propose
+  <name> --old --new --reason` instead. In-session agents edit skills they
+  loaded when they turn out wrong. When a session loads a skill, the v1
+  shell appends that skill's pending proposals to the skill tool output, so
+  the agent with the evidence applies or rejects them.
 - RL-SKL-003: `skill lint` flags `oversized` (SKILL.md > `skill_max_chars`,
   default 12 000), `incident-log-shape` (≥ 3 supersede/dated-update markers)
   and `references-sprawl` (> 20 reference files).
@@ -127,8 +135,10 @@ evidence make the edit, and measure every change.**
 - RL-INP-002: Tool notes: failed tool calls (tool, input summary ≤ 200 chars,
   error ≤ 300 chars) and skill loads are buffered as `Tool` entries (cap 20 per
   review); the review header lists skills loaded in the conversation.
-- RL-INP-003: `reviewer_model` and `reviewer_steps` config keys are passed to
-  the harness run.
+- RL-INP-003: `reviewer_model` / `reviewer_variant` config keys become
+  `--model` / `--variant` on the review run (step budgets live in the agent
+  definitions; the installer adds an `autolearn-curator` agent with 40 steps,
+  used automatically when present).
 - RL-INP-004: `skill set-verify <name> "<cmd>" [--expect-exit N]` writes the
   `verify:` frontmatter consumed by `falsify`.
 
@@ -156,3 +166,12 @@ evidence make the edit, and measure every change.**
    and run cost. `eval/judge.py` adds a blind pairwise LLM judgment of which
    variant captured the conversation's real signals with less noise.
    `eval/compare.py` aggregates both into one report.
+
+## Harness coverage
+
+The store, CLI, wrapper and prompt changes apply to every harness. The
+v1-only plugin hooks (per-session archive slice, tool notes, skill-load
+proposal surfacing, `AUTOLEARN_SESSION_ID`) live in `autolearn.js`; their
+helpers are in the shared core (`archiveSlice`, `toolNote`,
+`pendingProposalsNote`) so the v2 and pi shells can adopt them. Until then
+those shells inject the core memory only.
