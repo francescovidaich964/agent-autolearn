@@ -106,7 +106,7 @@ export default {
       // the authoritative gate in runReviewSubprocess then matches against,
       // suppressing every review (issue #14).
       const reviewMd = core.formatReview(st.buffer, { project: projectName(), trigger })
-      if (!core.throttleCheck(reviewMd, false)) {
+      if (!core.throttleVerdict(reviewMd, { commit: false, checkBusy: true }).ok) {
         core.dbg("REVIEW QUEUED by throttle (v2)", st.buffer.length, "messages, trigger", trigger)
         return
       }

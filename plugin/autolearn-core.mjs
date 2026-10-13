@@ -421,6 +421,31 @@ fi
 # ~32 KB with ENAMETOOLONG (issue #21).
 REVIEW_FILE="\$1"
 shift
+PDIR="\$AL/personas/default"
+REVIEWS="\$PDIR/reviews"
+PENDING="\$REVIEWS/pending"
+RUNLOG="\$PDIR/review-runs.jsonl"
+DRAIN_MAX=3
+PENDING_MAX_AGE_S=259200
+# One JSON line per wrapper decision (RL-OPS-001). Every value is a plain
+# token (review basename, integer, bareword), so no JSON escaping is needed;
+# extra fields are passed pre-formatted in \$3 using sh quote concatenation
+# (no backslashes: this script lives inside a JS template literal).
+runlog() {
+  printf '{"ts":%s,"event":"%s","review":"%s","design":"${DESIGN_VERSION}"%s}\\n' "\$(date +%s)" "\$1" "\$(basename "\$2" .md)" "\$3" >> "\$RUNLOG" 2>/dev/null
+}
+# A review the gates cannot run NOW is queued, never dropped (RL-OPS-002):
+# the plugin cleared its buffer when it handed us this file, so exiting here
+# would lose the conversation. The current gate holder drains the queue.
+defer() {
+  mkdir -p "\$PENDING" 2>/dev/null
+  if mv "\$REVIEW_FILE" "\$PENDING/" 2>/dev/null; then
+    runlog deferred "\$REVIEW_FILE" ',"reason":"'"\$1"'"'
+  else
+    runlog lost "\$REVIEW_FILE" ',"reason":"'"\$1"'"'
+  fi
+  exit 0
+}
 # Gate 3 first (cheap, no state change): identical conversation → skip.
 CONV=\$(sed -n '/## Conversation/,\$p' "\$REVIEW_FILE" 2>/dev/null)
 HASH=""
@@ -428,25 +453,27 @@ if [ -n "\$CONV" ]; then
   HASH=\$(printf '%s' "\$CONV" | md5 -q 2>/dev/null || printf '%s' "\$CONV" | md5sum | cut -d' ' -f1)
   OLDHASH=\$(cut -d: -f2 "\$LOCK" 2>/dev/null)
   if [ -n "\$HASH" ] && [ -n "\$OLDHASH" ] && [ "\$HASH" = "\$OLDHASH" ]; then
+    runlog skipped_duplicate "\$REVIEW_FILE" ""
     exit 0
   fi
 fi
-# Gate 2: start-to-start spacing (seconds).
+# Gate 2: start-to-start spacing (seconds). Too soon → queue, not drop.
 LAST=\$(cut -d: -f1 "\$LOCK" 2>/dev/null)
 case "\$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
 if [ \$(( NOW - LAST )) -lt "\$MIN_INTERVAL_S" ]; then
-  exit 0
+  defer interval
 fi
-# Gate 1: atomic claim. Losers exit; a gate older than 15 min is stale
-# (crashed run) and gets reclaimed.
+# Gate 1: atomic claim. Losers queue their review; a gate older than 15 min
+# is stale (crashed run) and gets reclaimed. The holder refreshes ts before
+# each run it drains, so a long drain is never mistaken for a crash.
 if ! mkdir "\$GATE" 2>/dev/null; then
   GAGE=\$(cat "\$GATE/ts" 2>/dev/null || echo 0)
   case "\$GAGE" in ''|*[!0-9]*) GAGE=0 ;; esac
   if [ \$((NOW - GAGE)) -gt 900 ]; then
     rm -rf "\$GATE"
-    mkdir "\$GATE" 2>/dev/null || exit 0
+    mkdir "\$GATE" 2>/dev/null || defer busy
   else
-    exit 0
+    defer busy
   fi
 fi
 printf '%s\\n' "\$NOW" > "\$GATE/ts" 2>/dev/null
@@ -460,34 +487,76 @@ if [ -z "\$OC" ]; then
   elif command -v opencode2 >/dev/null 2>&1; then OC=opencode2
   else OC=opencode; fi
 fi
-# pi branch: one-shot print-mode review, ephemeral (--no-session),
-# project-local resources ignored (-na), review md piped on stdin.
-if [ "\$(basename "\$OC")" = "pi" ]; then
-  "\$OC" -p --no-session -na < "\$REVIEW_FILE" >/dev/null 2>&1
-  AL_CLI="\$HOME/.agents/skills/autolearn/scripts/autolearn.py"
-  [ -f "\$AL_CLI" ] || AL_CLI="\$HOME/.agents/skills/autolearn-reviewer/scripts/autolearn.py"
-  if [ -n "\${AUTOLEARN_SYNC_API_KEY:-}" ] && [ -f "\${HOME}/.autolearn/.encryption_salt" ] && [ -f "\$AL_CLI" ]; then
-    uv run "\$AL_CLI" sync push >/dev/null 2>&1
+# run_review FILE [harness args...]: run one review and keep its per-step
+# accounting (<review>.run.jsonl) and stderr tail (<review>.run.err) next to
+# the review so completion, steps and cost are measurable offline
+# (RL-OPS-005). AUTOLEARN_REVIEW_ID reaches the reviewer's shell, so its
+# "log review-complete" joins this run exactly (RL-OPS-004).
+run_review() {
+  RF="\$1"
+  shift
+  BASE="\${RF%.md}"
+  RID=\$(basename "\$BASE")
+  T0=\$(date +%s)
+  printf '%s\\n' "\$T0" > "\$GATE/ts" 2>/dev/null
+  runlog started "\$RF" ""
+  SID=""
+  if [ "\$(basename "\$OC")" = "pi" ]; then
+    # pi branch: one-shot print-mode review, ephemeral (--no-session),
+    # project-local resources ignored (-na), review md piped on stdin.
+    AUTOLEARN_REVIEW_ID="\$RID" "\$OC" -p --no-session -na < "\$RF" >/dev/null 2> "\$BASE.run.err"
+    RC=\$?
+  else
+    OUT=\$(mktemp "\${TMPDIR:-/tmp}/alreview.XXXXXX")
+    AUTOLEARN_REVIEW_ID="\$RID" "\$OC" run --format json "\$@" < "\$RF" > "\$OUT" 2> "\$BASE.run.err"
+    RC=\$?
+    # BRE backslashes below are DOUBLED (\\\\, \\1) because this script lives
+    # inside a JS template literal — single backslashes get eaten by the escape
+    # evaluation (\\( -> ( , \\1 -> 0x01 control char under Bun) and the sed
+    # silently extracts nothing (issue #15).
+    # Output contract (verified against opencode v1.0.142..v1.18.31 and v2.0.3):
+    # both binaries emit "run --format json" as JSONL with a top-level
+    # "sessionID" on every line, so line-by-line sed extraction is safe.
+    SID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$OUT" | head -1)
+    # Keep only step accounting and errors: full tool output would add
+    # megabytes per review to the store.
+    grep -E '"type" *: *"(step_finish|step-finish|error)"' "\$OUT" > "\$BASE.run.jsonl" 2>/dev/null
+    rm -f "\$OUT"
+    if [ -n "\$SID" ]; then
+      case "\$(basename "\$OC")" in
+        opencode2) "\$OC" api delete "/api/session/\$SID" >/dev/null 2>&1 ;;
+        *)         "\$OC" session delete "\$SID" >/dev/null 2>&1 ;;
+      esac
+    fi
   fi
-  exit 0
-fi
-OUT=\$(mktemp "\${TMPDIR:-/tmp}/alreview.XXXXXX")
-"\$OC" run --format json "\$@" < "\$REVIEW_FILE" > "\$OUT" 2>/dev/null
-# BRE backslashes below are DOUBLED (\\\\, \\1) because this script lives
-# inside a JS template literal — single backslashes get eaten by the escape
-# evaluation (\\( -> ( , \\1 -> 0x01 control char under Bun) and the sed
-# silently extracts nothing (issue #15).
-# Output contract (verified against opencode v1.0.142..v1.18.31 and v2.0.3):
-# both binaries emit "run --format json" as JSONL with a top-level
-# "sessionID" on every line, so line-by-line sed extraction is safe.
-SID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$OUT" | head -1)
-rm -f "\$OUT"
-if [ -n "\$SID" ]; then
-  case "\$(basename "\$OC")" in
-    opencode2) "\$OC" api delete "/api/session/\$SID" >/dev/null 2>&1 ;;
-    *)         "\$OC" session delete "\$SID" >/dev/null 2>&1 ;;
-  esac
-fi
+  if [ -s "\$BASE.run.err" ]; then
+    tail -c 4000 "\$BASE.run.err" > "\$BASE.run.err.t" 2>/dev/null && mv "\$BASE.run.err.t" "\$BASE.run.err" 2>/dev/null
+  else
+    rm -f "\$BASE.run.err"
+  fi
+  HAS_SID=false
+  [ -n "\$SID" ] && HAS_SID=true
+  runlog finished "\$RF" ',"rc":'"\$RC"',"duration_s":'"\$(( \$(date +%s) - T0 ))"',"session":'"\$HAS_SID"
+}
+run_review "\$REVIEW_FILE" "\$@"
+# Drain reviews other wrappers queued while we held the gate (RL-OPS-002).
+DRAINED=0
+for P in "\$PENDING"/*.md; do
+  [ -f "\$P" ] || continue
+  [ "\$DRAINED" -lt "\$DRAIN_MAX" ] || break
+  N=\$(basename "\$P" .md)
+  TSMS=\${N##*-}
+  case "\$TSMS" in ''|*[!0-9]*) TSMS=0 ;; esac
+  if [ \$(( \$(date +%s) - TSMS / 1000 )) -gt "\$PENDING_MAX_AGE_S" ]; then
+    rm -f "\$P"
+    runlog expired "\$P" ""
+    continue
+  fi
+  mv "\$P" "\$REVIEWS/" 2>/dev/null || continue
+  runlog drained "\$P" ""
+  run_review "\$REVIEWS/\$N.md" "\$@"
+  DRAINED=\$((DRAINED + 1))
+done
 # Push after review completes so reviewer-written changes are included.
 # Stays silent when sync isn't configured (no API key or no salt).
 AL_CLI="\$HOME/.agents/skills/autolearn/scripts/autolearn.py"
@@ -697,7 +766,8 @@ export function formatReview(messages, meta = {}) {
   md += `- Project: ${project}\n`
   md += `- Date: ${new Date().toISOString()}\n`
   md += `- Turns in this review: ${messages.length}\n`
-  md += `- Trigger: ${trigger}\n\n`
+  md += `- Trigger: ${trigger}\n`
+  md += `- Design: ${DESIGN_VERSION}\n\n`
   md += "## Instructions\n\n"
   md += "Review the conversation below for learning opportunities.\n"
   md += "Load the autolearn skill and follow references/reviewer.md for the\n"
@@ -733,21 +803,19 @@ export function cleanStaleReviews(config) {
   try {
     const staleMs = (config.stale_after_days || STALE_DAYS_DEFAULT) * 86400000
     const now = Date.now()
-    const files = []
-    try {
-      for (const f of readdirSync(REVIEWS_DIR)) {
-        files.push(f)
-      }
-    } catch {
-      return
-    }
-    for (const f of files) {
-      if (!f.startsWith("review-")) continue
-      const match = f.match(/review-(?:exit-)?(\d+)\.md/)
-      if (!match) continue
-      const fileTime = parseInt(match[1], 10)
-      if (now - fileTime > staleMs) {
-        try { unlinkSync(join(REVIEWS_DIR, f)); dbg("CLEANED STALE REVIEW", f) } catch {}
+    // The review markdown plus its run sidecars (<id>.run.jsonl / .run.err,
+    // RL-OPS-005), in the reviews dir and the pending queue.
+    for (const dir of [REVIEWS_DIR, join(REVIEWS_DIR, "pending")]) {
+      let files = []
+      try { files = readdirSync(dir) } catch { continue }
+      for (const f of files) {
+        if (!f.startsWith("review-")) continue
+        const match = f.match(/^review-(?:exit-)?(\d+)\.(?:md|run\.jsonl|run\.err)$/)
+        if (!match) continue
+        const fileTime = parseInt(match[1], 10)
+        if (now - fileTime > staleMs) {
+          try { unlinkSync(join(dir, f)); dbg("CLEANED STALE REVIEW", f) } catch {}
+        }
       }
     }
   } catch (err) {
@@ -789,7 +857,34 @@ export function contentHash(str) {
   return (h >>> 0).toString(16)
 }
 
+// The wrapper's single-flight claim. A fresh claim means a review is running
+// right now (median ~5 min, p90 ~17 min in production) — handing the wrapper
+// another review would only get it queued, so the peek keeps the buffer
+// instead and the content rides the next trigger (RL-OPS-003).
+export const WRAPPER_GATE_DIR = join(AL_HOME, ".review_gate")
+export const WRAPPER_GATE_STALE_MS = 900000
+
+export function wrapperBusy(now = Date.now(), gateDir = WRAPPER_GATE_DIR) {
+  try {
+    if (!existsSync(gateDir)) return false
+    const ts = parseInt(readFileSync(join(gateDir, "ts"), "utf-8").trim(), 10) || 0
+    return now - ts * 1000 < WRAPPER_GATE_STALE_MS
+  } catch {
+    return false
+  }
+}
+
 export function throttleCheck(reviewMd, commit = true) {
+  return throttleVerdict(reviewMd, { commit }).ok
+}
+
+/**
+ * Like throttleCheck, but returns `{ ok, reason }` so callers can tell a
+ * permanent refusal (duplicate content, daily cap) from a transient one
+ * (busy wrapper, interval) that should be retried or queued.
+ * `checkBusy` makes the peek treat a running review as transient-busy.
+ */
+export function throttleVerdict(reviewMd, { commit = true, checkBusy = false } = {}) {
   // Hash the CONVERSATION section only, not the whole md: the Context header
   // (project name, timestamp) varies between plugin instances that observed
   // the same conversation, and those variants must still dedupe — that is
@@ -808,7 +903,12 @@ export function throttleCheck(reviewMd, commit = true) {
 
   if (contentHash(dedupeKey) === lastHash) {
     dbg("THROTTLED: identical review content already spawned")
-    return false
+    return { ok: false, reason: "duplicate" }
+  }
+
+  if (checkBusy && wrapperBusy()) {
+    dbg("THROTTLED: a review is running (wrapper gate held)")
+    return { ok: false, reason: "busy" }
   }
 
   const config = parseConfig()
@@ -817,7 +917,7 @@ export function throttleCheck(reviewMd, commit = true) {
   const gap = now - lastMs
   if (gap < minInterval) {
     dbg("THROTTLED: global min_interval_ms", gap, "<", minInterval)
-    return false
+    return { ok: false, reason: "interval" }
   }
 
   // Daily cap across all projects: reviews spawned today (file timestamps)
@@ -835,7 +935,7 @@ export function throttleCheck(reviewMd, commit = true) {
     } catch {}
     if (today >= dailyCap) {
       dbg("THROTTLED: daily cap reached", today, ">=", dailyCap)
-      return false
+      return { ok: false, reason: "daily_cap" }
     }
   }
 
@@ -845,8 +945,11 @@ export function throttleCheck(reviewMd, commit = true) {
   if (commit) {
     try { writeFileSync(THROTTLE_FILE, `${now}:${contentHash(dedupeKey)}`) } catch {}
   }
-  return true
+  return { ok: true, reason: null }
 }
+
+// Transient refusals: the content is new, just not runnable right now.
+const TRANSIENT_THROTTLE = new Set(["busy", "interval"])
 
 /**
  * Activity-coupled curator trigger (issue #23): decide whether the curator is
@@ -924,30 +1027,58 @@ export function maybeSpawnCurator({ cwd, project, env, spawnFn, now = Date.now()
  * callers can write the fallback file.
  */
 // @spec CM-RS-007..CM-RS-013
-export function runReviewSubprocess({ reviewMd, filePrefix = "review", title, cwd, env, messageCount, project, trigger, log = true }) {
+export const PENDING_DIR = join(REVIEWS_DIR, "pending")
+
+// Extra harness args for the review run from config (RL-INP-003):
+// reviewer_model -> --model, reviewer_variant -> --variant.
+export function reviewerArgs(config = parseConfig()) {
+  const out = []
+  if (config.reviewer_model) out.push("--model", String(config.reviewer_model))
+  if (config.reviewer_variant) out.push("--variant", String(config.reviewer_variant))
+  return out
+}
+
+export function runReviewSubprocess({ reviewMd, filePrefix = "review", title, cwd, env, messageCount, project, trigger, log = true, queueIfThrottled = false }) {
   // Cross-process throttle first: identical content never reviews twice, any
   // two reviews are separated by min_interval_ms (default 3 min), and a
   // daily cap bounds total provider spend.
   // @spec CM-RS-020
-  if (!throttleCheck(reviewMd)) {
-    dbg("REVIEW SUPPRESSED by throttle", { project, trigger })
-    if (log) {
-      logObs({ type: "review_throttled", project: project || "unknown", trigger: trigger || "unknown" })
+  const verdict = throttleVerdict(reviewMd)
+  if (!verdict.ok) {
+    // Callers that cannot retry later (the exit review: the session is
+    // ending and its buffer dies with it) queue transient refusals for the
+    // next wrapper run to drain instead of dropping them (RL-OPS-002).
+    if (queueIfThrottled && TRANSIENT_THROTTLE.has(verdict.reason)) {
+      try {
+        mkdirSync(PENDING_DIR, { recursive: true })
+        const queued = join(PENDING_DIR, `${filePrefix}-${Date.now()}.md`)
+        writeFileSync(queued, reviewMd)
+        logObs({ type: "review_deferred", review_id: queued.split(/[\\/]/).pop().replace(/\.md$/, ""), reason: verdict.reason, project: project || "unknown", trigger: trigger || "unknown" })
+        dbg("REVIEW QUEUED (throttled:", verdict.reason + ")", queued)
+        return { ok: false, reviewFile: queued, reviewMd, throttled: true, queued: true, reason: verdict.reason }
+      } catch (err) {
+        dbg("REVIEW QUEUE FAILED", err.message)
+      }
     }
-    return { ok: false, reviewFile: null, reviewMd, throttled: true }
+    dbg("REVIEW SUPPRESSED by throttle", { project, trigger, reason: verdict.reason })
+    if (log) {
+      logObs({ type: "review_throttled", reason: verdict.reason, project: project || "unknown", trigger: trigger || "unknown" })
+    }
+    return { ok: false, reviewFile: null, reviewMd, throttled: true, reason: verdict.reason }
   }
 
   // @spec CM-RS-007
   const reviewFile = join(REVIEWS_DIR, `${filePrefix}-${Date.now()}.md`)
   writeFileSync(reviewFile, reviewMd)
   dbg("REVIEW FILE WRITTEN", reviewFile)
+  const reviewId = reviewFile.split(/[\\/]/).pop().replace(/\.md$/, "")
 
   // @spec CM-RS-008, CM-RS-009, CM-RS-010
   // Pass the review FILE PATH, not the content: the wrapper streams the file
   // to the harness on stdin. Content-as-argv exceeds the Windows command-line
   // limit (32,767 chars) once the review passes ~32 KB and the spawn dies
   // with ENAMETOOLONG (issue #21).
-  const args = [reviewFile, "--agent", "autolearn-reviewer", "--title", title]
+  const args = [reviewFile, "--agent", "autolearn-reviewer", "--title", title, ...reviewerArgs()]
   spawnDetached(wrapperCommand(args), {
     cwd: cwd || process.cwd(),
     env: { ...process.env, AUTOLEARN_REVIEWER: "1", ...(env || {}) },
@@ -955,7 +1086,7 @@ export function runReviewSubprocess({ reviewMd, filePrefix = "review", title, cw
 
   // @spec CM-RS-013
   if (log) {
-    const obs = { type: "review_spawned", review_file: reviewFile }
+    const obs = { type: "review_spawned", review_file: reviewFile, review_id: reviewId }
     if (typeof messageCount === "number") obs.message_count = messageCount
     obs.project = project || "unknown"
     if (trigger) obs.trigger = trigger

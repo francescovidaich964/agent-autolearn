@@ -91,7 +91,7 @@ export const AutolearnPlugin = async (ctx) => {
     // the authoritative gate in runReviewSubprocess then matches against,
     // suppressing every review (issue #14).
     const reviewMd = core.formatReview(buffer, { project: projectName(), trigger })
-    if (!core.throttleCheck(reviewMd, false)) {
+    if (!core.throttleVerdict(reviewMd, { commit: false, checkBusy: true }).ok) {
       core.dbg("REVIEW QUEUED by throttle (v1)", buffer.length, "messages, trigger", trigger)
       return
     }
@@ -144,7 +144,13 @@ export const AutolearnPlugin = async (ctx) => {
         title: "autolearn exit review",
         cwd: reviewCwd(),
         env: { AUTOLEARN_OPENCODE_BIN: "opencode" },
-        log: false, // original exit path did not log an observation
+        // Logged like every other review so the metrics see exit reviews;
+        // a throttled exit review is queued: the buffer dies with the
+        // session, so dropping it would lose the conversation (RL-OPS-002).
+        trigger: "exit",
+        messageCount: captured.length,
+        project: projectName(),
+        queueIfThrottled: true,
       })
       core.dbg("EXIT REVIEW SPAWNED", captured.length, "messages")
     } catch (err) {
