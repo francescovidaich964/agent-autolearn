@@ -55,6 +55,11 @@ def slugify_text(text: str) -> str:
     return slug or "memory"
 
 
+def normalize_text(text: str) -> str:
+    """Case/whitespace-insensitive identity of a memory text."""
+    return " ".join((text or "").lower().split())
+
+
 def tokenize(text: str) -> list[str]:
     """Lowercase alphanumeric tokens (>=2 chars)."""
     return [t for t in re.findall(r"[a-z0-9]+", text.lower()) if len(t) >= 2]
@@ -189,11 +194,22 @@ class MemoryRegistry:
         return None
 
     def find_by_text(self, text: str) -> dict | None:
-        target = slugify_text(text)
+        # Compare the normalized FULL text: ids are 60-char slug prefixes, so
+        # two different lessons sharing a prefix used to collide here and the
+        # second one was silently dropped by add().
+        target = normalize_text(text)
         for r in self.load():
-            if r.get("id") == target:
+            if normalize_text(r.get("text", "")) == target:
                 return r
         return None
+
+    def unique_id(self, text: str, records: list[dict]) -> str:
+        base = slugify_text(text)
+        taken = {r.get("id") for r in records}
+        if base not in taken:
+            return base
+        suffix = hashlib.sha1(normalize_text(text).encode("utf-8")).hexdigest()[:6]
+        return f"{base[:ID_MAX_LEN - 7].rstrip('-')}-{suffix}"
 
     # -- mutation ----------------------------------------------------------
     # Every mutation is a load -> modify -> save cycle; it runs under the
@@ -212,6 +228,7 @@ class MemoryRegistry:
             rec = new_record(text, type, pinned=pinned, topics=topics)
             rec.update(fields)
             records = self.load()
+            rec["id"] = self.unique_id(text, records)
             records.append(rec)
             self.save(records)
             return rec

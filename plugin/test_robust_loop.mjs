@@ -15,6 +15,12 @@ import { join } from "path"
 
 const HOME = mkdtempSync(join(tmpdir(), "al-robust-test-"))
 process.env.AUTOLEARN_HOME = HOME
+// The v1 shell patches opencode.json and spawns `memory compose` on load:
+// point both at sandbox paths so the real config and CLI are never touched.
+process.env.AUTOLEARN_OPENCODE_CONFIG = join(HOME, "opencode.json")
+process.env.AUTOLEARN_CLI = join(HOME, "no-such-cli.py")
+delete process.env.AUTOLEARN_REVIEWER
+delete process.env.AUTOLEARN_DISABLED
 
 const core = await import("./autolearn-core.mjs")
 core.ensureStore()
@@ -195,6 +201,54 @@ rmSync(GATE, { recursive: true, force: true })
 // 7. Reviewer model/variant from config reach the harness args.
 ok(JSON.stringify(core.reviewerArgs({ reviewer_model: "prov/small", reviewer_variant: "minimal" })) === JSON.stringify(["--model", "prov/small", "--variant", "minimal"]), "reviewerArgs: model + variant")
 ok(core.reviewerArgs({}).length === 0, "reviewerArgs: none by default")
+
+// ---------------------------------------------------------------------------
+console.log("C. Per-session archive slice (RL-MEM-005)")
+
+function buildIndex(records, params = {}) {
+  const df = {}
+  let total = 0
+  for (const r of records) { total += r.topics.length; for (const t of r.topics) df[t] = (df[t] || 0) + 1 }
+  return { version: 2, params: { slice_chars: 1500, slice_max: 6, min_score: 1, min_overlap: 2, k1: 1.2, b: 0.75, ...params },
+    stats: { n: records.length, avgdl: total / records.length, df }, stopwords: ["the", "to", "with"], records }
+}
+const archive = [
+  { id: "gpg-cache", text: "GPG passphrase prompts: gpg-agent caches the passphrase", topics: ["gpg", "passphrase", "prompts", "agent", "caches"], retention: 0.9 },
+  { id: "hosta-gpg", text: "hosta commits stay unsigned: no GPG key", topics: ["hosta", "commits", "stay", "unsigned", "gpg", "key"], retention: 0.5 },
+  { id: "pandas", text: "pandas dtype coercion turns ints into floats", topics: ["pandas", "dtype", "coercion", "turns", "ints", "floats"], retention: 0.9 },
+]
+const sl = core.archiveSlice("how to sign commits with gpg passphrase", buildIndex(archive))
+ok(sl.map(r => r.id).includes("gpg-cache") && sl.map(r => r.id).includes("hosta-gpg") && !sl.some(r => r.id === "pandas"), "archiveSlice: relevant entries in, unrelated out")
+ok(core.archiveSlice("gpg", buildIndex(archive)).length === 0, "archiveSlice: single shared term is below the overlap floor")
+ok(core.archiveSlice("sign commits gpg passphrase", buildIndex(archive, { min_score: 99 })).length === 0, "archiveSlice: score floor applies")
+ok(core.formatArchiveSlice([]) === "" && core.formatArchiveSlice(sl).includes("- GPG passphrase"), "formatArchiveSlice")
+
+const projDir = join(HOME, "demo-project")
+mkdirSync(join(projDir, ".git"), { recursive: true })
+writeFileSync(join(projDir, ".git", "config"), '[remote "origin"]\n\turl = git@github.com:acme/demo-research.git\n')
+const ctxText = core.sessionContextText({ directory: projDir, firstMessage: "fix the placement config" })
+ok(ctxText.includes("demo-project") && ctxText.includes("research") && ctxText.includes("placement"), "sessionContextText: project + git remote + first message")
+ok(!core.sessionContextText({ directory: (await import("os")).homedir() }).toLowerCase().includes((await import("os")).userInfo().username.toLowerCase()), "sessionContextText: home dir contributes no username token")
+
+// Drive the real v1 shell hooks: first message -> slice -> frozen per session.
+writeFileSync(core.ARCHIVE_INDEX_FILE, JSON.stringify(buildIndex(archive)))
+writeFileSync(join(HOME, "opencode.json"), "{}\n")
+const shell = (await import("./autolearn.js")).default
+const hooks = await shell({ client: {}, directory: projDir, worktree: projDir })
+ok(typeof hooks["experimental.chat.system.transform"] === "function" && typeof hooks["chat.message"] === "function", "v1 shell exposes chat.message + system.transform hooks")
+await hooks["chat.message"]({ sessionID: "ses_a" }, { parts: [{ type: "text", text: "sign my commits with gpg without the passphrase prompt" }] })
+const out1 = { system: ["base prompt"] }
+await hooks["experimental.chat.system.transform"]({ sessionID: "ses_a" }, out1)
+ok(out1.system.length === 2 && out1.system[1].includes("gpg-agent caches"), "system.transform appends the relevant archive slice")
+writeFileSync(core.ARCHIVE_INDEX_FILE, JSON.stringify(buildIndex([archive[2]])))
+const out2 = { system: ["base prompt"] }
+await hooks["experimental.chat.system.transform"]({ sessionID: "ses_a" }, out2)
+ok(out2.system[1] === out1.system[1], "slice is frozen for the session (byte-stable system prompt)")
+const out3 = { system: ["base prompt"] }
+await hooks["experimental.chat.system.transform"]({ sessionID: "ses_b" }, out3)
+ok(out3.system.length === 1, "a session with nothing relevant gets no slice")
+const injected = JSON.parse(readFileSync(join(HOME, "opencode.json"), "utf-8"))
+ok(Array.isArray(injected.instructions) && injected.instructions[0] === core.MEMORY_FILE, "injectInstructions honours AUTOLEARN_OPENCODE_CONFIG (sandboxed)")
 
 // ---------------------------------------------------------------------------
 export function done() {

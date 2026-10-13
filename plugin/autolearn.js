@@ -55,6 +55,13 @@ export const AutolearnPlugin = async (ctx) => {
 
   const messageTexts = new Map()
   const messageRoles = new Map()
+  // Per-session state for the archive slice (RL-MEM-005); bounded so a
+  // weeks-long OpenCode process does not accumulate every session ever seen.
+  const firstMessages = new Map()
+  const sessionSlices = new Map()
+  const trimMap = (m, max = 200) => {
+    while (m.size > max) m.delete(m.keys().next().value)
+  }
 
   const projectName = () => core.projectLabel(directory || worktree || process.cwd())
   // Reviewer sessions run in a scratch directory, not the workspace: harness
@@ -294,6 +301,42 @@ export const AutolearnPlugin = async (ctx) => {
       } catch (err) {
         core.dbg("EVENT ERROR", err.message)
         console.error("[autolearn] Event error:", err.message)
+      }
+    },
+
+    // @spec RL-MEM-005 — remember each session's first user message: with the
+    // project it is the best relevance signal for the archive slice.
+    "chat.message": async (input, output) => {
+      try {
+        const sid = input?.sessionID
+        if (!sid || firstMessages.has(sid)) return
+        const text = (output?.parts || []).filter(p => p?.type === "text" && p.text).map(p => p.text).join("\n")
+        if (text) firstMessages.set(sid, text)
+        trimMap(firstMessages)
+      } catch (err) {
+        core.dbg("chat.message hook failed", err.message)
+      }
+    },
+
+    // @spec RL-MEM-005 — append the project-relevant archive slice, computed
+    // once per session and then frozen (byte-stable system prompt).
+    "experimental.chat.system.transform": async (input, output) => {
+      try {
+        if (config.session_archive_slice === false) return
+        const sid = input?.sessionID
+        if (!sid || !Array.isArray(output?.system)) return
+        if (!sessionSlices.has(sid)) {
+          const ctxText = core.sessionContextText({ directory: directory || worktree || process.cwd(), firstMessage: firstMessages.get(sid) })
+          const chosen = core.archiveSlice(ctxText)
+          sessionSlices.set(sid, core.formatArchiveSlice(chosen))
+          trimMap(sessionSlices)
+          core.dbg("ARCHIVE SLICE", sid, chosen.length, "entries")
+          if (chosen.length) core.logObs({ type: "archive_slice", session: sid, entries: chosen.length, ids: chosen.map(r => r.id), project: projectName() })
+        }
+        const slice = sessionSlices.get(sid)
+        if (slice) output.system.push(slice)
+      } catch (err) {
+        core.dbg("system.transform hook failed", err.message)
       }
     },
   }

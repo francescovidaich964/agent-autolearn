@@ -72,6 +72,8 @@ export const SALT_FILE = join(AL_HOME, ".encryption_salt")
 // autolearn-reviewer). Resolve the new path, fall back to the legacy one for
 // installs that predate the consolidation.
 function resolveCli() {
+  // AUTOLEARN_CLI pins the CLI (tests, A/B replays of a working tree).
+  if (process.env.AUTOLEARN_CLI) return process.env.AUTOLEARN_CLI
   const fresh = join(homedir(), ".agents", "skills", "autolearn", "scripts", "autolearn.py")
   try { if (existsSync(fresh)) return fresh } catch {}
   return join(homedir(), ".agents", "skills", "autolearn-reviewer", "scripts", "autolearn.py")
@@ -681,7 +683,8 @@ export function truncate(text, maxLen) {
 // @spec MI-CMP-009, MI-CMP-010
 export function injectInstructions() {
   try {
-    const configPath = join(homedir(), ".config", "opencode", "opencode.json")
+    // AUTOLEARN_OPENCODE_CONFIG redirects the patched config (tests, sandboxes).
+    const configPath = process.env.AUTOLEARN_OPENCODE_CONFIG || join(homedir(), ".config", "opencode", "opencode.json")
     if (!existsSync(configPath)) return
     const raw = readFileSync(configPath, "utf-8")
     const data = JSON.parse(raw)
@@ -722,6 +725,110 @@ export function composeContext() {
   } catch (err) {
     dbg("memory compose failed to spawn:", err.message)
   }
+}
+
+// ---------------------------------------------------------------------------
+// Per-session archive slice (RL-MEM-005). memory.context.md carries only the
+// hard-capped core (every harness injects it via `instructions`). The v1
+// shell adds the archive entries relevant to THIS session through
+// experimental.chat.system.transform, computed once and frozen per session
+// so the system prompt stays byte-stable (prefix cache). Python owns the
+// policy and exports records + params to memory.archive.json; the ranking
+// below mirrors memlayers.rank_score / archive_slice.
+export const ARCHIVE_INDEX_FILE = join(DEFAULT_PERSONA_DIR, "memory.archive.json")
+const archiveCache = { path: null, mtimeMs: -1, doc: null }
+
+export function loadArchiveIndex(path = ARCHIVE_INDEX_FILE) {
+  try {
+    const st = statSync(path)
+    if (archiveCache.path !== path || archiveCache.mtimeMs !== st.mtimeMs) {
+      archiveCache.doc = JSON.parse(readFileSync(path, "utf-8"))
+      archiveCache.mtimeMs = st.mtimeMs
+      archiveCache.path = path
+    }
+    return archiveCache.doc
+  } catch {
+    return null
+  }
+}
+
+export function contextTokens(text, stopwords = []) {
+  const stop = new Set(stopwords)
+  const out = new Set()
+  for (const t of String(text || "").toLowerCase().match(/[a-z0-9]+/g) || []) {
+    if (t.length >= 2 && !stop.has(t)) out.add(t)
+  }
+  return out
+}
+
+// BM25 over the archive (binary tf), mirroring memlayers.bm25 / search /
+// archive_slice: rare shared terms dominate, long entries are normalized.
+export function archiveSlice(contextText, doc = loadArchiveIndex()) {
+  if (!doc || !Array.isArray(doc.records) || !doc.stats) return []
+  const p = doc.params || {}
+  const sliceChars = p.slice_chars ?? 1500
+  const sliceMax = p.slice_max ?? 6
+  const minScore = p.min_score ?? 8
+  const minOverlap = p.min_overlap ?? 2
+  const k1 = p.k1 ?? 1.2
+  const b = p.b ?? 0.75
+  const { n, avgdl, df } = doc.stats
+  const ctx = contextTokens(contextText, doc.stopwords || [])
+  if (!ctx.size || !n) return []
+  const scored = []
+  for (const rec of doc.records) {
+    const toks = rec.topics || []
+    if (!toks.length) continue
+    const norm = 1 - b + b * (toks.length / (avgdl || 1))
+    const tfPart = (k1 + 1) / (1 + k1 * norm)
+    let score = 0
+    let overlap = 0
+    for (const t of toks) {
+      if (!ctx.has(t)) continue
+      overlap++
+      const d = df[t] || 0
+      score += Math.log(1 + (n - d + 0.5) / (d + 0.5)) * tfPart
+    }
+    if (overlap < minOverlap || score <= 0) continue
+    const ret = rec.retention == null ? 0.5 : Number(rec.retention)
+    scored.push({ rec, score: score * (0.75 + 0.25 * ret) })
+  }
+  scored.sort((a, c) => c.score - a.score)
+  const chosen = []
+  let used = 0
+  for (const { rec, score } of scored) {
+    if (score < minScore) break
+    const cost = `- ${rec.text}\n`.length
+    if (used + cost > sliceChars) continue
+    chosen.push(rec)
+    used += cost
+    if (chosen.length >= sliceMax) break
+  }
+  return chosen
+}
+
+export function formatArchiveSlice(records) {
+  if (!records || !records.length) return ""
+  let out = "# Autolearn: memories relevant to this session\n\n"
+  out += "<!-- Retrieved from the autolearn archive for this project/request. -->\n\n"
+  for (const r of records) out += `- ${r.text}\n`
+  return out
+}
+
+// Session context for relevance: project label, directory segments, the git
+// origin URL (repo name is often the best signal), and the first user message.
+export function sessionContextText({ directory, firstMessage } = {}) {
+  // The home directory's own name (the username) matches nothing useful and
+  // its path segments only add noise, so it contributes no project label.
+  const label = projectLabel(directory)
+  const parts = [label.toLowerCase() === projectLabel(homedir()).toLowerCase() ? "" : label]
+  try {
+    const cfg = readFileSync(join(directory, ".git", "config"), "utf-8")
+    const m = cfg.match(/\[remote "origin"\][^[]*?url\s*=\s*(\S+)/)
+    if (m) parts.push(m[1].replace(/[/:.]+/g, " "))
+  } catch {}
+  if (firstMessage) parts.push(String(firstMessage).slice(0, 2000))
+  return parts.join(" ")
 }
 
 export const MAX_OBS_LINES = 1000

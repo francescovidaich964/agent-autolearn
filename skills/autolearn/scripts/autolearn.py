@@ -64,6 +64,8 @@ import stdio_guard
 import storelock
 # Write-time prompt-injection / secret scan (RL-INT-005).
 import safety
+# Two-tier memory: hard-capped core + relevance-retrieved archive (RL-MEM).
+import memlayers
 
 # Memory Insight subsystem (registry + retention + composer + shift + ui).
 # These are siblings in the same scripts dir; imported here so the CLI can
@@ -736,13 +738,25 @@ def memory_registry():
     return registry.MemoryRegistry(ACTIVE_PERSONA_DIR)
 
 
+def write_context(ctx: set | None = None) -> str:
+    """Migrate layers if needed, write memory.context.md (core) + the archive index."""
+    reg = memory_registry()
+    cfg = memlayers.load_config(ACTIVE_PERSONA_DIR)
+    memlayers.migrate(reg, cfg)
+    records = reg.load()
+    md = composer.compose(reg, ctx or set(), {
+        **composer.DEFAULT_CONFIG,
+        "core_caps": {"memory": cfg["core_memory_chars"], "user": cfg["core_user_chars"]},
+    })
+    storelock.atomic_write_text(ACTIVE_PERSONA_DIR / "memory.context.md", md)
+    memlayers.write_archive_index(ACTIVE_PERSONA_DIR, records, cfg)
+    return md
+
+
 def refresh_context():
-    """Regenerate memory.context.md after a registry mutation (retention-only ranking)."""
+    """Regenerate memory.context.md after a registry mutation."""
     try:
-        reg = memory_registry()
-        md = composer.compose(reg, set())
-        out = ACTIVE_PERSONA_DIR / "memory.context.md"
-        storelock.atomic_write_text(out, md)
+        write_context()
     except Exception:
         pass  # context refresh must never break a memory write
 
@@ -783,36 +797,200 @@ def guard_text(text: str, kind: str) -> None:
         sys.exit(3)
 
 
-# @spec MI-REG-015, MI-CMP-009
-def cmd_memory_add(args):
+def _refuse(exc: "memlayers.Refused", kind: str) -> None:
+    """Print a refused write with its resolution hints and exit 2."""
+    log_observation({"type": "write_refused", "kind": kind, "reason": exc.reason})
+    print(f"Refused: {exc}", file=sys.stderr)
+    for line in exc.details:
+        print(f"  {line}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _add_entry(args, type_: str) -> dict:
+    """Shared memory/user add: safety scan, duplicate + core-cap admission."""
     ensure_dirs()
-    guard_text(args.content, "memory")
+    text = (args.content or "").strip()
+    guard_text(text, type_)
     reg = memory_registry()
-    rec = reg.add(args.content, "memory")
+    cfg = memlayers.load_config(ACTIVE_PERSONA_DIR)
+    layer = "archive" if getattr(args, "archive", False) else "core"
+    try:
+        check = memlayers.make_check(getattr(args, "check_path", None),
+                                     getattr(args, "check_pattern", None),
+                                     getattr(args, "check_expect", None))
+    except memlayers.Refused as exc:
+        _refuse(exc, type_)
+    with reg.lock():
+        memlayers.migrate(reg, cfg)
+        records = reg.load()
+        exact = reg.find_by_text(text)
+        if exact is not None and exact.get("status") == "active":
+            print(f"Already recorded ({exact['id']}); use `memory strengthen --id {exact['id']}` to reinforce it.")
+            sys.exit(0)
+        try:
+            memlayers.admit(text, type_, layer, records, cfg,
+                            force_duplicate=bool(getattr(args, "force", False)))
+        except memlayers.Refused as exc:
+            _refuse(exc, type_)
+        fields = {"layer": layer}
+        if check:
+            fields["check"] = check
+        rec = reg.add(text, type_, pinned=bool(getattr(args, "pin", False)), **fields)
     refresh_context()
-    print(f"Memory updated: {rec['text'][:80]}")
+    return rec
+
+
+# @spec MI-REG-015, MI-CMP-009, RL-MEM-002
+def cmd_memory_add(args):
+    rec = _add_entry(args, "memory")
+    print(f"Memory updated [{rec.get('layer', 'core')}] {rec['id']}: {rec['text'][:80]}")
+
+
+def _resolve_one(reg, ident: str | None, keyword: str | None, type_: str | None = None) -> dict:
+    """Find exactly one active entry by id or by keyword substring."""
+    active = [r for r in reg.load_active() if type_ is None or r.get("type") == type_]
+    if ident:
+        rec = next((r for r in active if r.get("id") == ident), None)
+        if rec is None:
+            print(f"No active entry with id '{ident}'.", file=sys.stderr)
+            sys.exit(1)
+        return rec
+    kw = (keyword or "").lower()
+    matches = [r for r in active if kw and kw in r["text"].lower()]
+    if len(matches) != 1:
+        lead = "Multiple" if matches else "No"
+        hint = "; pass --id <id>:" if matches else "."
+        print(f"{lead} entries match '{keyword}'{hint}", file=sys.stderr)
+        for r in matches[:10]:
+            print(f"  {r['id']}: {r['text'][:100]}", file=sys.stderr)
+        sys.exit(1)
+    return matches[0]
+
+
+def cmd_memory_demote(args):
+    """Move a core entry to the archive (frees core space; still retrievable)."""
+    reg = memory_registry()
+    with reg.lock():
+        rec = _resolve_one(reg, args.id, None)
+        rec["layer"] = "archive"
+        reg.update(rec)
+    refresh_context()
+    print(f"Demoted to archive: {rec['id']}")
+
+
+def cmd_memory_promote(args):
+    """Move an archive entry into the always-injected core (cap-checked)."""
+    reg = memory_registry()
+    cfg = memlayers.load_config(ACTIVE_PERSONA_DIR)
+    with reg.lock():
+        rec = _resolve_one(reg, args.id, None)
+        try:
+            memlayers.admit(rec["text"], rec.get("type", "memory"), "core", reg.load(), cfg,
+                            force_duplicate=True, exclude_id=rec["id"])
+        except memlayers.Refused as exc:
+            _refuse(exc, rec.get("type", "memory"))
+        rec["layer"] = "core"
+        reg.update(rec)
+    refresh_context()
+    print(f"Promoted to core: {rec['id']}")
+
+
+def cmd_memory_edit(args):
+    """Rewrite one entry in place (merge, shorten, supersede). The id is stable."""
+    reg = memory_registry()
+    cfg = memlayers.load_config(ACTIVE_PERSONA_DIR)
+    text = args.content.strip()
+    guard_text(text, "memory")
+    with reg.lock():
+        rec = _resolve_one(reg, args.id, None)
+        try:
+            memlayers.admit(text, rec.get("type", "memory"), memlayers.layer_of(rec), reg.load(), cfg,
+                            force_duplicate=True, exclude_id=rec["id"])
+        except memlayers.Refused as exc:
+            _refuse(exc, rec.get("type", "memory"))
+        history = list(rec.get("edits") or [])[-2:]
+        history.append({"date": date.today().isoformat(), "old": rec["text"]})
+        rec["edits"] = history
+        rec["text"] = text
+        rec["topics"] = registry.extract_topics(text)
+        reg.update(rec)
+    refresh_context()
+    print(f"Edited {rec['id']} [{memlayers.layer_of(rec)}]: {text[:80]}")
+
+
+def cmd_memory_search(args):
+    reg = memory_registry()
+    layer = None if getattr(args, "all_layers", False) else "archive"
+    hits = memlayers.search(reg.load(), args.terms, limit=args.limit, layer=layer)
+    if not hits:
+        print("No matching entries.")
+        return
+    for score, r in hits:
+        print(f"  [{score:.2f}] {r['id']} [{memlayers.layer_of(r)}/{r.get('type')}]: {r['text']}")
+
+
+def cmd_memory_verify(args):
+    reg = memory_registry()
+    dry = bool(getattr(args, "dry_run", False))
+    res = memlayers.verify_checks(reg, dry_run=dry)
+    label = "would retire" if dry else "retired"
+    print(f"Checked {res['checked']} code-state memories; {label} {len(res['retired'])}; "
+          f"{len(res['unknown'])} not evaluable here.")
+    for r in res["retired"]:
+        print(f"  {r['id']}: {r['detail']} :: {r['text']}")
+    if res["retired"] and not dry:
+        log_observation({"type": "memories_retired", "count": len(res["retired"]),
+                         "ids": [r["id"] for r in res["retired"]]})
+        refresh_context()
 
 
 def cmd_memory_remove(args):
+    # A keyword used to delete EVERY match, so one vague reviewer call could
+    # wipe a swath of the store. Now: exactly one match (or --id), unless
+    # --all is explicit.
     reg = memory_registry()
-    keyword = args.keyword.lower()
-    matches = [r for r in reg.load_active() if keyword in r["text"].lower()]
-    for r in matches:
+    if getattr(args, "id", None) or not getattr(args, "all", False):
+        targets = [_resolve_one(reg, getattr(args, "id", None), args.keyword)]
+    else:
+        keyword = (args.keyword or "").lower()
+        targets = [r for r in reg.load_active() if keyword and keyword in r["text"].lower()]
+    for r in targets:
         reg.remove(r["id"])
     refresh_context()
-    print(f"Removed {len(matches)} entries ({len(reg.load_active())} remaining)")
+    print(f"Removed {len(targets)} entries ({len(reg.load_active())} remaining)")
+
+
+def _list_entries(args, type_: str | None) -> None:
+    reg = memory_registry()
+    cfg = memlayers.load_config(ACTIVE_PERSONA_DIR)
+    memlayers.migrate(reg, cfg)
+    records = reg.load_active()
+    if type_:
+        records = [r for r in records if r.get("type") == type_]
+    want = getattr(args, "layer", None)
+    shown = [r for r in records if not want or memlayers.layer_of(r) == want]
+    if not records:
+        print("User profile is empty." if type_ == "user" else "Memory is empty.")
+        return
+    for layer in ("core", "archive"):
+        rows = [r for r in shown if memlayers.layer_of(r) == layer]
+        if not rows:
+            continue
+        print(f"[{layer}]")
+        for r in rows:
+            flags = (" pinned" if r.get("pinned") else "") + (" check" if r.get("check") else "")
+            print(f"  {r['id']} ({r.get('type')}{flags}): {r['text']}")
+    allrec = reg.load()
+    for t in ("memory", "user"):
+        if type_ and t != type_:
+            continue
+        print(f"core {t}: {memlayers.core_used(allrec, t)}/{memlayers.cap_for(t, cfg)} chars")
+    n_arch = sum(1 for r in records if memlayers.layer_of(r) == "archive")
+    print(f"Total: {len(records)} active ({len(records) - n_arch} core, {n_arch} archive)")
 
 
 def cmd_memory_list(args):
-    reg = memory_registry()
-    records = reg.load_active()
-    if not records:
-        print("Memory is empty.")
-        return
-    for i, r in enumerate(records, 1):
-        print(f"  {i}. {r['text']}")
-    total = len(reg.load())
-    print(f"\nTotal: {len(records)} active entries (registry: {total} total incl. evicted)")
+    _list_entries(args, None)
 
 
 def cmd_memory_strengths(args):
@@ -832,17 +1010,10 @@ def cmd_memory_strengths(args):
 
 def cmd_memory_strengthen(args):
     reg = memory_registry()
-    keyword = args.keyword.lower()
-    matches = [r for r in reg.load_active() if keyword in r["text"].lower()]
-    if not matches:
-        print(f"No memory entries matching '{args.keyword}'.")
+    if not getattr(args, "id", None) and not getattr(args, "keyword", None):
+        print("Pass --id <id> or a keyword.", file=sys.stderr)
         sys.exit(1)
-    if len(matches) > 1:
-        print(f"Multiple entries match '{args.keyword}', please be more specific:")
-        for i, r in enumerate(matches, 1):
-            print(f"  {i}. {r['text'][:100]}")
-        sys.exit(1)
-    rec = matches[0]
+    rec = _resolve_one(reg, getattr(args, "id", None), getattr(args, "keyword", None))
     reg.reinforce(rec["id"])
     refresh_context()
     new = reg.get(rec["id"])
@@ -906,11 +1077,9 @@ def cmd_retention_evict(args):
 
 # @spec MI-CMP-001
 def cmd_memory_compose(args):
-    reg = memory_registry()
     ctx = composer.tokens(args.context) if getattr(args, "context", None) else set()
-    md = composer.compose(reg, ctx)
+    md = write_context(ctx)
     out = ACTIVE_PERSONA_DIR / "memory.context.md"
-    storelock.atomic_write_text(out, md)
     n = max(0, md.count("\n- "))
     print(f"Wrote {out} ({n} entries, {len(md)} chars)")
 
@@ -939,18 +1108,17 @@ def cmd_topics_candidates(args):
 
 # @spec KS-MEM-004, KS-MEM-005, MI-REG-015  (user profile now lives in the registry, type="user")
 def cmd_user_add(args):
-    ensure_dirs()
-    guard_text(args.content, "user")
-    reg = memory_registry()
-    reg.add(args.content, "user")
-    refresh_context()
-    print(f"User profile updated: {args.content[:80]}")
+    rec = _add_entry(args, "user")
+    print(f"User profile updated [{rec.get('layer', 'core')}] {rec['id']}: {rec['text'][:80]}")
 
 
 def cmd_user_remove(args):
     reg = memory_registry()
-    keyword = args.keyword.lower()
-    matches = [r for r in reg.load_active() if r.get("type") == "user" and keyword in r["text"].lower()]
+    if getattr(args, "id", None) or not getattr(args, "all", False):
+        matches = [_resolve_one(reg, getattr(args, "id", None), args.keyword, type_="user")]
+    else:
+        keyword = (args.keyword or "").lower()
+        matches = [r for r in reg.load_active() if r.get("type") == "user" and keyword and keyword in r["text"].lower()]
     for r in matches:
         reg.remove(r["id"])
     refresh_context()
@@ -958,13 +1126,7 @@ def cmd_user_remove(args):
 
 
 def cmd_user_list(args):
-    reg = memory_registry()
-    entries = [r for r in reg.load_active() if r.get("type") == "user"]
-    if not entries:
-        print("User profile is empty.")
-        return
-    for i, r in enumerate(entries, 1):
-        print(f"  {i}. {r['text']}")
+    _list_entries(args, "user")
 
 
 # @spec SM-SC-001, SM-SC-002, SM-SC-003, SM-SC-004, SM-SC-005
@@ -2399,14 +2561,43 @@ def main():
 
     mem = sub.add_parser("memory", help="Manage persistent memory", parents=[persona_parent])
     mem_sub = mem.add_subparsers(dest="subcommand")
-    mem_add = mem_sub.add_parser("add", help="Add a memory entry")
-    mem_add.add_argument("content", help="The lesson to remember")
-    mem_rm = mem_sub.add_parser("remove", help="Remove entries matching keyword")
-    mem_rm.add_argument("keyword", help="Keyword to match")
-    mem_sub.add_parser("list", help="List all memory entries")
+    def _entry_add_flags(p):
+        p.add_argument("content", help="The lesson to remember")
+        p.add_argument("--archive", action="store_true",
+                       help="Store in the archive (retrieved by relevance) instead of the always-injected core")
+        p.add_argument("--force", action="store_true", help="Add even if a near-duplicate exists")
+        p.add_argument("--pin", action="store_true", help="Pin (core, never evicted)")
+
+    mem_add = mem_sub.add_parser("add", help="Add a memory entry (core by default; refused when core is full)")
+    _entry_add_flags(mem_add)
+    mem_add.add_argument("--check-path", default=None,
+                         help="Code-state memory: file whose content decides whether the memory still holds")
+    mem_add.add_argument("--check-pattern", default=None, help="Regex looked up in --check-path")
+    mem_add.add_argument("--check-expect", default="present", choices=["present", "absent"],
+                         help="The memory holds while the pattern is present|absent (default present)")
+    mem_rm = mem_sub.add_parser("remove", help="Remove one entry (by --id or a unique keyword)")
+    mem_rm.add_argument("keyword", nargs="?", default=None, help="Keyword matching exactly one entry")
+    mem_rm.add_argument("--id", default=None, help="Exact entry id")
+    mem_rm.add_argument("--all", action="store_true", help="Remove every entry matching the keyword")
+    mem_list = mem_sub.add_parser("list", help="List memory entries by layer, with ids and core usage")
+    mem_list.add_argument("--layer", choices=["core", "archive"], default=None)
     mem_sub.add_parser("strengths", help="Show reinforcement statistics")
     mem_strength = mem_sub.add_parser("strengthen", help="Reinforce an existing memory (agent semantic dedup)")
-    mem_strength.add_argument("keyword", help="Keyword matching the entry to strengthen")
+    mem_strength.add_argument("keyword", nargs="?", default=None, help="Keyword matching the entry to strengthen")
+    mem_strength.add_argument("--id", default=None, help="Exact entry id (preferred)")
+    mem_demote = mem_sub.add_parser("demote", help="Move a core entry to the archive")
+    mem_demote.add_argument("id", help="Entry id")
+    mem_promote = mem_sub.add_parser("promote", help="Move an archive entry into the core (cap-checked)")
+    mem_promote.add_argument("id", help="Entry id")
+    mem_edit = mem_sub.add_parser("edit", help="Rewrite an entry in place (merge / shorten / supersede)")
+    mem_edit.add_argument("id", help="Entry id")
+    mem_edit.add_argument("content", help="New text")
+    mem_search = mem_sub.add_parser("search", help="Search the archive by relevance")
+    mem_search.add_argument("terms", help="Query text")
+    mem_search.add_argument("--limit", type=int, default=10)
+    mem_search.add_argument("--all-layers", action="store_true", help="Search core too")
+    mem_verify = mem_sub.add_parser("verify", help="Retire code-state memories whose check no longer holds")
+    mem_verify.add_argument("--dry-run", action="store_true")
     mem_weaken = mem_sub.add_parser("weaken", help="Reduce reinforcement on a memory")
     mem_weaken.add_argument("keyword", help="Keyword matching the entry to weaken")
     mem_compose = mem_sub.add_parser("compose", help="Generate memory.context.md from the registry")
@@ -2414,11 +2605,14 @@ def main():
 
     usr = sub.add_parser("user", help="Manage user profile", parents=[persona_parent])
     usr_sub = usr.add_subparsers(dest="subcommand")
-    usr_add = usr_sub.add_parser("add", help="Add a preference")
-    usr_add.add_argument("content", help="The preference to record")
-    usr_rm = usr_sub.add_parser("remove", help="Remove entries matching keyword")
-    usr_rm.add_argument("keyword", help="Keyword to match")
-    usr_sub.add_parser("list", help="List all user profile entries")
+    usr_add = usr_sub.add_parser("add", help="Add a preference (core by default; refused when core is full)")
+    _entry_add_flags(usr_add)
+    usr_rm = usr_sub.add_parser("remove", help="Remove one entry (by --id or a unique keyword)")
+    usr_rm.add_argument("keyword", nargs="?", default=None, help="Keyword matching exactly one entry")
+    usr_rm.add_argument("--id", default=None, help="Exact entry id")
+    usr_rm.add_argument("--all", action="store_true", help="Remove every entry matching the keyword")
+    usr_list = usr_sub.add_parser("list", help="List user profile entries by layer")
+    usr_list.add_argument("--layer", choices=["core", "archive"], default=None)
 
     sk = sub.add_parser("skill", help="Manage agent-created skills", parents=[persona_parent])
     sk_sub = sk.add_subparsers(dest="subcommand")
@@ -2582,6 +2776,11 @@ def main():
             "strengthen": cmd_memory_strengthen,
             "weaken": cmd_memory_weaken,
             "compose": cmd_memory_compose,
+            "demote": cmd_memory_demote,
+            "promote": cmd_memory_promote,
+            "edit": cmd_memory_edit,
+            "search": cmd_memory_search,
+            "verify": cmd_memory_verify,
         },
         "user": {
             "add": cmd_user_add,
