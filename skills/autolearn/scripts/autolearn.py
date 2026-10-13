@@ -66,6 +66,8 @@ import storelock
 import safety
 # Two-tier memory: hard-capped core + relevance-retrieved archive (RL-MEM).
 import memlayers
+# Skill exact edits, proposals, rewrites, lint, audit (RL-SKL).
+import skillops
 
 # Memory Insight subsystem (registry + retention + composer + shift + ui).
 # These are siblings in the same scripts dir; imported here so the CLI can
@@ -1144,13 +1146,17 @@ def cmd_skill_create(args):
 
     skill_dir.mkdir(parents=True, exist_ok=True)
 
+    verify = ""
+    if getattr(args, "verify_command", None):
+        guard_text(args.verify_command, "skill")
+        verify = "\n".join(skillops.verify_block(args.verify_command, args.verify_exit)) + "\n"
     content = f"""---
 name: {name}
 description: |
   {desc}
 created_by: autolearn
 created_at: "{date.today().isoformat()}"
----
+{verify}---
 
 # {name.replace("-", " ").title()}
 
@@ -1196,8 +1202,294 @@ TODO: Add specific instructions based on observed patterns.
     print(f"Created skill: {name} at {skill_dir} (linked to {link_path})")
 
 
+def _role() -> str:
+    if os.environ.get("AUTOLEARN_REVIEWER") == "1":
+        return "reviewer"
+    if os.environ.get("AUTOLEARN_CURATOR") == "1":
+        return "curator"
+    return "session"
+
+
+def _deny_reviewer(action: str) -> None:
+    """RL-SKL-002: the reviewer works from a truncated transcript and patched
+    skills it never saw loaded; edits belong to the agent that used the skill.
+    The reviewer stages a proposal instead."""
+    if _role() != "reviewer":
+        return
+    log_observation({"type": "skill_edit_denied", "action": action})
+    print(f"Refused: reviewers cannot {action} skills directly.\n"
+          "  -> stage it: skill propose <name> --old \"<exact text>\" --new \"<replacement>\" --reason \"<evidence>\"\n"
+          "  -> the next session that loads the skill (or the curator/human) applies it.",
+          file=sys.stderr)
+    sys.exit(4)
+
+
+def _touch_usage(name: str, *, patched: bool = True, **fields) -> None:
+    with store_lock():
+        usage = load_usage()
+        meta = usage.get(name)
+        if meta is None:
+            return
+        if patched:
+            meta["patch_count"] = meta.get("patch_count", 0) + 1
+        meta["last_activity_at"] = date.today().isoformat()
+        meta.update({k: v for k, v in fields.items() if v is not None})
+        save_usage(usage)
+
+
+def _ledger(action: str, skill: str, summary: str, outcome: str = "accepted", trigger: str = "review") -> None:
+    if not wiki_layer.enabled(ACTIVE_PERSONA_DIR):
+        return
+    try:
+        wiki_layer.ensure_scaffold(ACTIVE_PERSONA_DIR)
+        wiki_layer.append_skill_impact(ACTIVE_PERSONA_DIR, action=action, skill=skill,
+                                       summary=summary[:300], outcome=outcome, trigger=trigger)
+    except Exception as exc:
+        print(f"(wiki ledger skipped: {exc})")
+
+
+def _skillop_fail(exc: "skillops.SkillOpError", code: int = 2) -> None:
+    print(f"Refused: {exc}", file=sys.stderr)
+    for line in exc.details:
+        print(f"  {line}", file=sys.stderr)
+    sys.exit(code)
+
+
+# @spec RL-SKL-001
+def cmd_skill_edit(args):
+    _deny_reviewer("edit")
+    name = slugify(args.name)
+    guard_text(args.new, "skill")
+    try:
+        res = skillops.apply_edit(SKILLS_DIR, name, args.old, args.new, args.file)
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc)
+    session = os.environ.get("AUTOLEARN_SESSION_ID")
+    _touch_usage(name, last_edit_session=session)
+    log_observation({"type": "skill_edited", "skill": name, "role": _role(), "session": session,
+                     "delta_chars": res["delta_chars"]})
+    _ledger("patch", name, f"[edit {args.file or 'SKILL.md'}] {args.new[:250]}",
+            trigger="review" if _role() == "session" else "curator")
+    print(f"Edited {name}/{args.file or 'SKILL.md'} ({res['delta_chars']:+d} chars); backup: {res['backup']}")
+
+
+# @spec RL-SKL-002
+def cmd_skill_propose(args):
+    name = slugify(args.name)
+    guard_text(f"{args.new}\n{args.reason}", "skill")
+    try:
+        path = skillops.resolve_file(SKILLS_DIR, name, args.file)
+        skillops.exact_replace(path.read_text(encoding="utf-8").replace("\r\n", "\n"),
+                               args.old.replace("\r\n", "\n"), args.new)
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc)
+    prop = skillops.add_proposal(SKILLS_DIR, kind="edit", skill=name, file=args.file or "SKILL.md",
+                                 old=args.old, new=args.new, reason=args.reason, source=_role(),
+                                 review_id=os.environ.get("AUTOLEARN_REVIEW_ID"))
+    log_observation({"type": "skill_proposed", "skill": name, "kind": "edit", "proposal": prop["id"], "role": _role()})
+    print(f"Staged edit proposal {prop['id']} for {name}. Apply with: skill apply {prop['id']}")
+
+
+# @spec RL-SKL-004
+def cmd_skill_rewrite(args):
+    name = slugify(args.name)
+    new_text = Path(args.from_file).read_text(encoding="utf-8")
+    guard_text(new_text, "skill")
+    try:
+        cur = skillops.resolve_file(SKILLS_DIR, name).read_text(encoding="utf-8")
+        skillops.validate_frontmatter(new_text)
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc)
+    refs = SKILLS_DIR / name / "references"
+    ref_texts = [p.read_text(encoding="utf-8", errors="replace") for p in refs.glob("*.md")] if refs.is_dir() else []
+    report = skillops.preservation_report(cur, [new_text] + ref_texts)
+    staged_dir = SKILLS_DIR / ".proposals"
+    staged_dir.mkdir(parents=True, exist_ok=True)
+    prop = skillops.add_proposal(SKILLS_DIR, kind="rewrite", skill=name, file="SKILL.md",
+                                 reason=args.reason, source=_role(), old_chars=len(cur), new_chars=len(new_text),
+                                 missing=report["missing"][:50])
+    storelock.atomic_write_text(staged_dir / f"{prop['id']}.md", new_text)
+    log_observation({"type": "skill_proposed", "skill": name, "kind": "rewrite", "proposal": prop["id"],
+                     "role": _role(), "missing": len(report["missing"])})
+    print(f"Staged rewrite proposal {prop['id']} for {name}: {len(cur)} -> {len(new_text)} chars; "
+          f"{report['critical']} critical tokens, {len(report['missing'])} missing.")
+    for t in report["missing"][:20]:
+        print(f"  missing: {t}")
+    print(f"Apply with: skill apply {prop['id']}" + ("" if not report["missing"] else
+          "  (refused until the missing tokens are restored or moved to references/, "
+          "or a human passes --accept-loss)"))
+
+
+def cmd_skill_proposals(args):
+    items = skillops.load_proposals(SKILLS_DIR)
+    if not getattr(args, "all", False):
+        items = [p for p in items if p.get("status") == "pending"]
+    if not items:
+        print("No pending skill proposals.")
+        return
+    for p in items:
+        extra = f" missing={len(p.get('missing') or [])}" if p.get("kind") == "rewrite" else ""
+        print(f"  {p['id']} [{p.get('status')}] {p.get('kind')} {p.get('skill')}/{p.get('file')} "
+              f"by {p.get('source')}{extra}: {(p.get('reason') or '')[:100]}")
+
+
+# @spec RL-SKL-002, RL-SKL-004
+def cmd_skill_apply(args):
+    _deny_reviewer("apply proposals to")
+    try:
+        prop = skillops.get_proposal(SKILLS_DIR, args.id)
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc, 1)
+    if prop.get("status") != "pending":
+        print(f"Proposal {prop['id']} is already {prop.get('status')}.", file=sys.stderr)
+        sys.exit(1)
+    name = prop["skill"]
+    try:
+        if prop["kind"] == "edit":
+            res = skillops.apply_edit(SKILLS_DIR, name, prop["old"], prop["new"], prop.get("file"))
+        else:
+            if _role() == "curator" and not load_config().get("auto_apply_rewrites", False):
+                print("Refused: the curator may only stage rewrites (auto_apply_rewrites is off).", file=sys.stderr)
+                sys.exit(4)
+            new_text = (SKILLS_DIR / ".proposals" / f"{prop['id']}.md").read_text(encoding="utf-8")
+            path = skillops.resolve_file(SKILLS_DIR, name)
+            cur = path.read_text(encoding="utf-8")
+            refs = SKILLS_DIR / name / "references"
+            ref_texts = [p.read_text(encoding="utf-8", errors="replace") for p in refs.glob("*.md")] if refs.is_dir() else []
+            missing = skillops.preservation_report(cur, [new_text] + ref_texts)["missing"]
+            if missing and not (getattr(args, "accept_loss", None) and _role() == "session"):
+                raise skillops.SkillOpError(
+                    f"rewrite would drop {len(missing)} critical token(s)",
+                    details=[f"missing: {t}" for t in missing[:20]]
+                    + ["-> restore them (or move them to references/<topic>.md) and stage again",
+                       "-> a human may pass --accept-loss \"<why>\""])
+            bak = skillops.backup(SKILLS_DIR, name, path)
+            storelock.atomic_write_text(path, new_text)
+            res = {"backup": str(bak) if bak else None, "delta_chars": len(new_text) - len(cur)}
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc)
+    with store_lock():
+        skillops.set_proposal_status(SKILLS_DIR, prop["id"], "applied", applied_by=_role(),
+                                     accept_loss=getattr(args, "accept_loss", None))
+    _touch_usage(name, last_edit_session=os.environ.get("AUTOLEARN_SESSION_ID"))
+    log_observation({"type": "skill_proposal_applied", "skill": name, "kind": prop["kind"],
+                     "proposal": prop["id"], "role": _role(), "delta_chars": res["delta_chars"]})
+    _ledger("patch", name, f"[{prop['kind']} {prop['id']}] {(prop.get('reason') or '')[:240]}",
+            trigger="curator" if _role() == "curator" else "review")
+    print(f"Applied {prop['kind']} proposal {prop['id']} to {name} ({res['delta_chars']:+d} chars); backup: {res['backup']}")
+
+
+def cmd_skill_reject(args):
+    with store_lock():
+        try:
+            prop = skillops.set_proposal_status(SKILLS_DIR, args.id, "rejected", reject_reason=args.reason,
+                                                rejected_by=_role())
+        except skillops.SkillOpError as exc:
+            _skillop_fail(exc, 1)
+    _ledger("patch", prop["skill"], f"[rejected {prop['id']}] {args.reason[:240]}", outcome="rejected",
+            trigger="curator" if _role() == "curator" else "review")
+    print(f"Rejected proposal {args.id}.")
+
+
+# @spec RL-SKL-003
+def cmd_skill_lint(args):
+    cfg = {**skillops.LINT_DEFAULTS, **{k: v for k, v in load_config().items() if k in skillops.LINT_DEFAULTS}}
+    names = [slugify(args.name)] if getattr(args, "name", None) else sorted(
+        p.parent.name for p in SKILLS_DIR.glob("*/SKILL.md"))
+    report = {n: skillops.lint_skill(SKILLS_DIR / n / "SKILL.md", cfg) for n in names
+              if (SKILLS_DIR / n / "SKILL.md").is_file()}
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2))
+        return
+    flagged = {n: f for n, f in report.items() if f}
+    for n, fs in flagged.items():
+        for f in fs:
+            print(f"  {n}: {f['rule']} {f['value']} -> {f['hint']}")
+    print(f"{len(flagged)} of {len(report)} skill(s) flagged.")
+
+
+# @spec RL-SKL-005
+def cmd_skill_pin(args):
+    name = slugify(args.name)
+    cap = int(load_config().get("max_pinned_skills", 5))
+    with store_lock():
+        usage = load_usage()
+        if name not in usage:
+            print(f"Skill not tracked: {name}", file=sys.stderr)
+            sys.exit(1)
+        pinned = [n for n, m in usage.items() if m.get("pinned") and n != name]
+        if len(pinned) >= cap:
+            print(f"Refused: {len(pinned)}/{cap} skills already pinned ({', '.join(sorted(pinned))}). "
+                  "Unpin one first; pins exempt skills from every lifecycle rule.", file=sys.stderr)
+            sys.exit(2)
+        usage[name]["pinned"] = True
+        usage[name]["pin_reason"] = args.reason
+        usage[name]["pinned_at"] = date.today().isoformat()
+        save_usage(usage)
+    log_observation({"type": "skill_pinned", "skill": name, "role": _role()})
+    print(f"Pinned {name}: {args.reason}")
+
+
+def cmd_skill_unpin(args):
+    name = slugify(args.name)
+    with store_lock():
+        usage = load_usage()
+        if name in usage:
+            usage[name]["pinned"] = False
+            usage[name].pop("pin_reason", None)
+            save_usage(usage)
+    print(f"Unpinned {name}")
+
+
+def _rewrite_frontmatter(name: str, key: str, block: list[str], label: str) -> None:
+    try:
+        path = skillops.resolve_file(SKILLS_DIR, name)
+        cur = path.read_text(encoding="utf-8")
+        new = skillops.set_frontmatter_block(cur, key, block)
+        skillops.validate_frontmatter(new)
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc)
+    bak = skillops.backup(SKILLS_DIR, name, path)
+    storelock.atomic_write_text(path, new)
+    _touch_usage(name)
+    log_observation({"type": "skill_frontmatter", "skill": name, "key": key, "role": _role()})
+    _ledger("patch", name, f"[{label}] " + " ".join(block)[:250],
+            trigger="curator" if _role() == "curator" else "review")
+    print(f"Updated {label} of {name}; backup: {bak}")
+
+
+# @spec RL-SKL-006
+def cmd_skill_set_description(args):
+    _deny_reviewer("change the description of")
+    guard_text(args.description, "skill")
+    _rewrite_frontmatter(slugify(args.name), "description", skillops.description_block(args.description), "description")
+
+
+# @spec RL-INP-004
+def cmd_skill_set_verify(args):
+    guard_text(args.verify_cmd, "skill")
+    _rewrite_frontmatter(slugify(args.name), "verify", skillops.verify_block(args.verify_cmd, args.expect_exit), "verify")
+
+
+# @spec RL-SKL-006
+def cmd_skill_audit(args):
+    rows = skillops.audit_never_loaded(SKILLS_DIR, load_usage(), SEARCH_DB, min_age_days=args.min_age_days)
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No never-loaded skills past the grace period.")
+        return
+    if not SEARCH_DB.exists():
+        print("(search index missing: run `search init` first; every skill shows as dormant)")
+    for r in rows:
+        print(f"  {r['skill']} age={r['age_days']}d recurred_in={r['recurred_sessions']} session(s) "
+              f"-> {r['verdict']}  terms: {', '.join(r['terms'])}")
+
+
 # @spec SM-SP-001, SM-SP-002, SM-SP-003, SM-SP-004, SM-SP-005
 def cmd_skill_patch(args):
+    _deny_reviewer("patch")
     name = slugify(args.name)
     section = args.section
     content = args.content
@@ -1260,6 +1552,8 @@ def cmd_skill_patch(args):
             print(f"(wiki ledger/provenance skipped: {exc})")
 
     print(f"Patched skill: {name} (section: {section})")
+    print("note: patch only APPENDS a bullet; to correct stale text use "
+          "`skill edit <name> --old \"<exact>\" --new \"<text>\"` so the skill states the current truth once.")
 
 
 # @spec SM-SA-001, SM-SA-002, SM-SA-003, SM-SA-004, SM-SA-005
@@ -1312,7 +1606,13 @@ def cmd_skill_list(args):
         count = meta.get("use_count", 0)
         patches = meta.get("patch_count", 0)
         last = meta.get("last_activity_at", "unknown")
-        print(f"  {name} [{state}] uses={count} patches={patches} last={last}")
+        sk = SKILLS_DIR / name / "SKILL.md"
+        size = f" size={sk.stat().st_size}" if sk.is_file() else ""
+        pin = f" pinned ({meta.get('pin_reason', 'no reason')})" if meta.get("pinned") else ""
+        print(f"  {name} [{state}] uses={count} patches={patches} last={last}{size}{pin}")
+    pending = [p for p in skillops.load_proposals(SKILLS_DIR) if p.get("status") == "pending"]
+    if pending:
+        print(f"{len(pending)} pending skill proposal(s): run `skill proposals`")
 
 
 # @spec SM-SU-001, SM-SU-002
@@ -1375,6 +1675,16 @@ def cmd_curator_run(args):
         storelock.sweep_tmp(ACTIVE_PERSONA_DIR)
     except Exception:
         pass
+    # RL-MEM-007: retire code-state memories whose check no longer holds.
+    # Mechanical, so it does not depend on the curator agent remembering it.
+    try:
+        retired = memlayers.verify_checks(memory_registry())["retired"]
+        if retired:
+            log_observation({"type": "memories_retired", "count": len(retired), "ids": [r["id"] for r in retired]})
+            refresh_context()
+            print(f"  memory: retired {len(retired)} code-state memorie(s) whose check failed")
+    except Exception as exc:
+        print(f"  (memory verify skipped: {exc})")
 
     with store_lock():
         usage = load_usage()
@@ -1984,12 +2294,15 @@ def cmd_log_review_complete(args):
     if getattr(args, "nothing", False):
         entry["nothing_recorded"] = True
         entry["observations"] = 0
+        topics_raw = getattr(args, "topics", "") or ""
+        entry["topics"] = [t.strip() for t in topics_raw.split(",") if t.strip()]
     else:
         entry["observations"] = getattr(args, "observations", 0) or 0
         entry["memory_updated"] = getattr(args, "memory_updated", False) or False
         entry["user_profile_updated"] = getattr(args, "user_profile_updated", False) or False
         entry["skills_created"] = getattr(args, "skills_created", 0) or 0
         entry["skills_patched"] = getattr(args, "skills_patched", 0) or 0
+        entry["skills_proposed"] = getattr(args, "skills_proposed", 0) or 0
         topics_raw = getattr(args, "topics", "") or ""
         entry["topics"] = [t.strip() for t in topics_raw.split(",") if t.strip()]
 
@@ -2620,10 +2933,56 @@ def main():
     sk_create.add_argument("name", help="Skill name")
     sk_create.add_argument("description", help="Skill description")
     sk_create.add_argument("--patterns", default="", help="Comma-separated wiki pattern slugs motivating this skill (recorded in PURPOSE.md)")
-    sk_patch = sk_sub.add_parser("patch", help="Patch an existing skill")
+    sk_create.add_argument("--verify-command", default=None,
+                           help="Cheap deterministic check proving the procedure works (falsify runs it)")
+    sk_create.add_argument("--verify-exit", type=int, default=0, help="Expected exit code (default 0)")
+    sk_patch = sk_sub.add_parser("patch", help="APPEND a bullet to a section (prefer `skill edit`)")
     sk_patch.add_argument("name", help="Skill name")
     sk_patch.add_argument("section", help="Section to patch")
     sk_patch.add_argument("content", help="Content to add")
+    sk_edit = sk_sub.add_parser("edit", help="Replace exactly one occurrence of --old with --new")
+    sk_edit.add_argument("name", help="Skill name")
+    sk_edit.add_argument("--old", required=True, help="Exact existing text (must occur once)")
+    sk_edit.add_argument("--new", required=True, help="Replacement text")
+    sk_edit.add_argument("--file", default=None, help="File inside the skill dir (default SKILL.md)")
+    sk_prop = sk_sub.add_parser("propose", help="Stage an exact edit for the agent with the evidence to apply")
+    sk_prop.add_argument("name", help="Skill name")
+    sk_prop.add_argument("--old", required=True, help="Exact existing text (must occur once)")
+    sk_prop.add_argument("--new", required=True, help="Replacement text")
+    sk_prop.add_argument("--reason", required=True, help="Evidence: what went wrong / what the user said")
+    sk_prop.add_argument("--file", default=None, help="File inside the skill dir (default SKILL.md)")
+    sk_rw = sk_sub.add_parser("rewrite", help="Stage a full SKILL.md rewrite (preservation-checked on apply)")
+    sk_rw.add_argument("name", help="Skill name")
+    sk_rw.add_argument("--from-file", required=True, help="File holding the complete new SKILL.md")
+    sk_rw.add_argument("--reason", required=True, help="Why (e.g. lint: incident-log-shape)")
+    sk_props = sk_sub.add_parser("proposals", help="List staged skill proposals")
+    sk_props.add_argument("--all", action="store_true", help="Include applied/rejected")
+    sk_apply = sk_sub.add_parser("apply", help="Apply a staged proposal")
+    sk_apply.add_argument("id", help="Proposal id")
+    sk_apply.add_argument("--accept-loss", default=None,
+                          help="(humans only) accept a rewrite that drops critical tokens, with a reason")
+    sk_rej = sk_sub.add_parser("reject", help="Reject a staged proposal (recorded in the ledger)")
+    sk_rej.add_argument("id", help="Proposal id")
+    sk_rej.add_argument("--reason", required=True)
+    sk_lint = sk_sub.add_parser("lint", help="Flag oversized / incident-log-shaped / sprawling skills")
+    sk_lint.add_argument("name", nargs="?", default=None)
+    sk_lint.add_argument("--json", action="store_true")
+    sk_pin = sk_sub.add_parser("pin", help="Exempt a skill from lifecycle rules (capped)")
+    sk_pin.add_argument("name")
+    sk_pin.add_argument("--reason", required=True, help="Why it must stay despite rare loads")
+    sk_unpin = sk_sub.add_parser("unpin", help="Remove a pin")
+    sk_unpin.add_argument("name")
+    sk_desc = sk_sub.add_parser("set-description", help="Replace the frontmatter description only")
+    sk_desc.add_argument("name")
+    sk_desc.add_argument("description")
+    sk_ver = sk_sub.add_parser("set-verify", help="Attach a verify: block (command + expected exit)")
+    sk_ver.add_argument("name")
+    # dest must not be "command": that is the top-level subcommand attribute.
+    sk_ver.add_argument("verify_cmd", metavar="command", help="Shell command proving the procedure works")
+    sk_ver.add_argument("--expect-exit", type=int, default=0)
+    sk_audit = sk_sub.add_parser("audit", help="Classify never-loaded skills: description failed vs dormant")
+    sk_audit.add_argument("--min-age-days", type=int, default=21)
+    sk_audit.add_argument("--json", action="store_true")
     sk_archive = sk_sub.add_parser("archive", help="Archive a skill")
     sk_archive.add_argument("name", help="Skill name")
     sk_sub.add_parser("list", help="List all agent-created skills")
@@ -2656,6 +3015,7 @@ def main():
     log_rc.add_argument("--user-profile-updated", action="store_true", help="User profile was updated")
     log_rc.add_argument("--skills-created", type=int, default=0, help="Skills created count")
     log_rc.add_argument("--skills-patched", type=int, default=0, help="Skills patched count")
+    log_rc.add_argument("--skills-proposed", type=int, default=0, help="Skill proposals staged")
     log_rc.add_argument("--topics", default="", help="Comma-separated topics in the conversation")
     log_rc.add_argument("--nothing", action="store_true", help="Nothing was recorded")
 
@@ -2793,6 +3153,18 @@ def main():
             "archive": cmd_skill_archive,
             "list": cmd_skill_list,
             "usage": cmd_skill_usage,
+            "edit": cmd_skill_edit,
+            "propose": cmd_skill_propose,
+            "rewrite": cmd_skill_rewrite,
+            "proposals": cmd_skill_proposals,
+            "apply": cmd_skill_apply,
+            "reject": cmd_skill_reject,
+            "lint": cmd_skill_lint,
+            "pin": cmd_skill_pin,
+            "unpin": cmd_skill_unpin,
+            "set-description": cmd_skill_set_description,
+            "set-verify": cmd_skill_set_verify,
+            "audit": cmd_skill_audit,
         },
         "curator": {
             "run": cmd_curator_run,

@@ -398,7 +398,7 @@ if [ "\$1" = "--curator" ]; then
     printf '%s' "\$CPROMPT" | "\$OC" -p --no-session -na >/dev/null 2>&1
   else
     COUT=\$(mktemp "\${TMPDIR:-/tmp}/alcurator.XXXXXX")
-    "\$OC" run --format json --agent autolearn-reviewer "\$CPROMPT" > "\$COUT" 2>/dev/null
+    "\$OC" run --format json --agent "\${AUTOLEARN_CURATOR_AGENT:-autolearn-reviewer}" "\$CPROMPT" > "\$COUT" 2>/dev/null
     CSID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$COUT" | head -1)
     rm -f "\$COUT"
     if [ -n "\$CSID" ]; then
@@ -831,6 +831,66 @@ export function sessionContextText({ directory, firstMessage } = {}) {
   return parts.join(" ")
 }
 
+// ---------------------------------------------------------------------------
+// Tool notes (RL-INP-002, RL-SKL-007). Built from tool.execute.after: the
+// strongest learning signal is "a call failed -> the user redirected", and
+// the reviewer only ever saw the prose around it. Notes are compact and
+// redacted; successful calls produce none except skill loads/edits.
+const SKILL_FILE_RE = /[\\/]skills[\\/]([^\\/]+)[\\/](?:SKILL\.md|references[\\/][^\\/]+)$/i
+
+function lastLines(text, n = 6) {
+  return String(text || "").trim().split(/\r?\n/).slice(-n).join(" | ")
+}
+
+export function toolNote(input = {}, output = {}) {
+  const tool = String(input.tool || "")
+  const args = input.args || {}
+  const meta = output.metadata || {}
+  if (tool === "skill") {
+    const name = args.name || args.id
+    return name ? { kind: "skill_load", skill: String(name), text: `[skill] loaded ${name}` } : null
+  }
+  const filePath = args.filePath || args.file_path || args.path || ""
+  const m = typeof filePath === "string" ? filePath.match(SKILL_FILE_RE) : null
+  if (m && /^(edit|write|patch|multiedit|apply_patch)$/i.test(tool)) {
+    return { kind: "skill_edit", skill: m[1], text: `[skill-edit] ${m[1]} via ${tool}` }
+  }
+  const out = typeof output.output === "string" ? output.output : ""
+  const exit = meta.exit ?? meta.exitCode
+  const failed = (exit != null && Number(exit) !== 0) || /^\s*error\b/i.test(out)
+  if (!failed) return null
+  const what = tool === "bash" ? (args.command || "") : (filePath || args.pattern || args.url || JSON.stringify(args))
+  const status = exit != null ? `exit ${exit}` : "error"
+  return {
+    kind: "tool_error",
+    text: `[tool error] ${tool}: ${redact(truncate(String(what), 200))} -> ${status}: ${redact(truncate(lastLines(out), 300))}`,
+  }
+}
+
+// Pending skill proposals (staged by the reviewer, which may not edit skills
+// itself) surface at the moment a session LOADS that skill: the agent that
+// is using it has the evidence to apply or reject them (RL-SKL-002).
+export const SKILL_PROPOSALS_FILE = join(SKILLS_DIR, ".proposals.json")
+
+export function pendingProposalsNote(skill, { file = SKILL_PROPOSALS_FILE, max = 3 } = {}) {
+  let items = []
+  try { items = JSON.parse(readFileSync(file, "utf-8")) } catch { return "" }
+  const mine = (Array.isArray(items) ? items : []).filter(p => p && p.status === "pending" && p.skill === skill)
+  if (!mine.length) return ""
+  let out = `\n\n<autolearn-proposals skill="${skill}">\n`
+  out += `${mine.length} pending improvement(s) for this skill were staged from earlier sessions. `
+  out += "If what you observe while using the skill confirms one, apply it; if it is wrong, reject it with the reason:\n"
+  for (const p of mine.slice(0, max)) {
+    if (p.kind === "edit") {
+      out += `- ${p.id} (${p.file || "SKILL.md"}): replace "${truncate(String(p.old || ""), 160)}" with "${truncate(String(p.new || ""), 240)}" — reason: ${truncate(String(p.reason || ""), 200)}\n`
+    } else {
+      out += `- ${p.id}: full rewrite staged (${p.old_chars} -> ${p.new_chars} chars) — reason: ${truncate(String(p.reason || ""), 200)}\n`
+    }
+  }
+  out += `Apply: uv run "${AUTOLEARN_CLI}" skill apply <id>   Reject: uv run "${AUTOLEARN_CLI}" skill reject <id> --reason "<why>"\n</autolearn-proposals>`
+  return out
+}
+
 export const MAX_OBS_LINES = 1000
 
 // @spec KS-OBS-001, KS-OBS-002, KS-OBS-003
@@ -874,7 +934,11 @@ export function formatReview(messages, meta = {}) {
   md += `- Date: ${new Date().toISOString()}\n`
   md += `- Turns in this review: ${messages.length}\n`
   md += `- Trigger: ${trigger}\n`
-  md += `- Design: ${DESIGN_VERSION}\n\n`
+  md += `- Design: ${DESIGN_VERSION}\n`
+  // RL-INP-002: the reviewer must know which skills were actually used — it
+  // stages proposals only for those, and never patches blind.
+  const loaded = [...(meta.loadedSkills || [])]
+  md += `- Skills loaded in this conversation: ${loaded.length ? loaded.join(", ") : "none"}\n\n`
   md += "## Instructions\n\n"
   md += "Review the conversation below for learning opportunities.\n"
   md += "Load the autolearn skill and follow references/reviewer.md for the\n"
@@ -897,7 +961,7 @@ export function formatReview(messages, meta = {}) {
   md += "## Conversation\n\n"
 
   for (const msg of messages) {
-    const label = msg.role === "user" ? "User" : "Assistant"
+    const label = msg.role === "user" ? "User" : msg.role === "tool" ? "Tool" : "Assistant"
     md += `### ${label}\n\n${msg.content}\n\n`
   }
 
@@ -1095,6 +1159,19 @@ export function curatorDue({ config = parseConfig(), now = Date.now(), stateFile
  * enforces the real single-flight gate; this side adds the spawn cooldown
  * so a dead curator run is not re-attempted on every review.
  */
+// The curator gets its own agent (larger step budget) when the installer
+// defined one; otherwise the wrapper falls back to the reviewer agent.
+export function curatorAgentName() {
+  const cfg = parseConfig()
+  if (cfg.curator_agent) return String(cfg.curator_agent)
+  try {
+    const configPath = process.env.AUTOLEARN_OPENCODE_CONFIG || join(homedir(), ".config", "opencode", "opencode.json")
+    const data = JSON.parse(readFileSync(configPath, "utf-8"))
+    if (data?.agent?.["autolearn-curator"]) return "autolearn-curator"
+  } catch {}
+  return null
+}
+
 export function maybeSpawnCurator({ cwd, project, env, spawnFn, now = Date.now(), config, stateFile, cooldownFile } = {}) {
   try {
     const verdict = curatorDue({ ...(config ? { config } : {}), now, ...(stateFile ? { stateFile } : {}), ...(cooldownFile ? { cooldownFile } : {}) })
@@ -1110,9 +1187,10 @@ export function maybeSpawnCurator({ cwd, project, env, spawnFn, now = Date.now()
     // per harness family, and dropping the pin would let the wrapper's PATH
     // fallback route a v1-pinned curator to opencode2 (or pi) — the binary-
     // shadowing failure mode. AUTOLEARN_CURATOR marks the run for debugging.
+    const curatorAgent = curatorAgentName()
     spawn(wrapperCommand(["--curator"]), {
       cwd: cwd || process.cwd(),
-      env: { ...process.env, AUTOLEARN_CURATOR: "1", ...(env || {}) },
+      env: { ...process.env, AUTOLEARN_CURATOR: "1", ...(curatorAgent ? { AUTOLEARN_CURATOR_AGENT: curatorAgent } : {}), ...(env || {}) },
     })
     const obs = { type: "curator_triggered", project: project || "unknown", interval_days: verdict.intervalDays }
     if (verdict.lastRunMs) obs.last_run = new Date(verdict.lastRunMs).toISOString().slice(0, 10)

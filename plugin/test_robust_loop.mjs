@@ -251,6 +251,43 @@ const injected = JSON.parse(readFileSync(join(HOME, "opencode.json"), "utf-8"))
 ok(Array.isArray(injected.instructions) && injected.instructions[0] === core.MEMORY_FILE, "injectInstructions honours AUTOLEARN_OPENCODE_CONFIG (sandboxed)")
 
 // ---------------------------------------------------------------------------
+console.log("D. Tool notes, skill attribution, proposal surfacing (RL-INP-002, RL-SKL)")
+
+const load = core.toolNote({ tool: "skill", args: { name: "demo-project" } }, { output: "..." })
+ok(load && load.kind === "skill_load" && load.skill === "demo-project", "toolNote: skill load")
+const sedit = core.toolNote({ tool: "edit", args: { filePath: "C:\\Users\\me\\.agents\\skills\\offline-runner\\SKILL.md" } }, { output: "ok" })
+ok(sedit && sedit.kind === "skill_edit" && sedit.skill === "offline-runner", "toolNote: in-session edit of a skill file (Windows path)")
+const bashFail = core.toolNote({ tool: "bash", args: { command: "pytest -x tests/ --token=abcdefghijklmnop" } }, { output: "collected 3\nFAILED test_a\nerror: 1 failed", metadata: { exit: 1 } })
+ok(bashFail && bashFail.kind === "tool_error" && bashFail.text.includes("exit 1") && bashFail.text.includes("FAILED"), "toolNote: failed bash call -> error note with exit code + tail")
+ok(!bashFail.text.includes("abcdefghijklmnop"), "toolNote: secrets redacted")
+ok(core.toolNote({ tool: "bash", args: { command: "ls" } }, { output: "a\nb", metadata: { exit: 0 } }) === null, "toolNote: successful call -> no note")
+ok(core.toolNote({ tool: "read", args: { filePath: "/x" } }, { output: "Error: file not found" }).kind === "tool_error", "toolNote: tool error text -> error note")
+
+const mdNotes = core.formatReview([{ role: "tool", content: "[tool error] bash: x -> exit 1: boom" }], { project: "p", trigger: "idle", loadedSkills: new Set(["demo-project"]) })
+ok(mdNotes.includes("### Tool") && mdNotes.includes("- Skills loaded in this conversation: demo-project"), "formatReview: Tool label + loaded skills header")
+ok(core.formatReview([{ role: "user", content: "hi" }], {}).includes("Skills loaded in this conversation: none"), "formatReview: no skills -> none")
+
+mkdirSync(core.SKILLS_DIR, { recursive: true })
+writeFileSync(core.SKILL_PROPOSALS_FILE, JSON.stringify([
+  { id: "p1", status: "pending", kind: "edit", skill: "demo-project", file: "SKILL.md", old: "use --tp 4", new: "use --tp 8", reason: "user corrected TP" },
+  { id: "p2", status: "applied", kind: "edit", skill: "demo-project", old: "a", new: "b", reason: "done" },
+  { id: "p3", status: "pending", kind: "edit", skill: "other", old: "a", new: "b", reason: "x" },
+]))
+const pnote = core.pendingProposalsNote("demo-project")
+ok(pnote.includes("p1") && !pnote.includes("p2") && !pnote.includes("p3") && pnote.includes("skill apply"), "pendingProposalsNote: only this skill's pending proposals")
+ok(core.pendingProposalsNote("nothing-here") === "", "pendingProposalsNote: none -> empty")
+
+const envOut = { env: {} }
+await hooks["shell.env"]({ cwd: projDir, sessionID: "ses_a" }, envOut)
+ok(envOut.env.AUTOLEARN_SESSION_ID === "ses_a", "shell.env exports AUTOLEARN_SESSION_ID to the agent's shell")
+const skillOut = { title: "", output: "SKILL BODY", metadata: {} }
+await hooks["tool.execute.after"]({ tool: "skill", sessionID: "ses_a", callID: "c1", args: { name: "demo-project" } }, skillOut)
+ok(skillOut.output.startsWith("SKILL BODY") && skillOut.output.includes("<autolearn-proposals skill=\"demo-project\">"), "loading a skill surfaces its pending proposals to the agent")
+await hooks["tool.execute.after"]({ tool: "write", sessionID: "ses_a", callID: "c2", args: { filePath: join(core.SKILLS_DIR, "demo-project", "SKILL.md") } }, { output: "ok", metadata: {} })
+const obsAll = readFileSync(core.OBS_FILE, "utf-8")
+ok(obsAll.includes('"skill_edited_in_session"') && obsAll.includes('"skill_proposals_surfaced"'), "skill edits/proposal surfacing are observable")
+
+// ---------------------------------------------------------------------------
 export function done() {
   console.log(`\n${passed} passed, ${failed} failed`)
   rmSync(HOME, { recursive: true, force: true })
