@@ -118,9 +118,9 @@ truncated transcript; the agent that loads the skill next has the evidence.
 At most ONE skill action per review:
 
 1. **A skill listed under "Skills loaded" was wrong or incomplete** → read
-   it (`read` tool on `~/.agents/skills/<name>/SKILL.md`), then stage an
-   exact replacement. The next session that loads the skill sees it and
-   applies or rejects it:
+   it (`read` tool on `~/.autolearn/personas/default/skills/<name>/SKILL.md`;
+   `~/.agents/skills/<name>` links there), then stage an exact replacement.
+   The next session that loads the skill sees it and applies or rejects it:
 
    ```bash
    uv run $AL skill propose <name> --old "<exact current text>" \
