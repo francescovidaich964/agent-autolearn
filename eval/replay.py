@@ -429,8 +429,86 @@ def live_leak_check() -> bool:
     return False
 
 
+def review_time_ms(case_file: Path) -> int | None:
+    m = re.search(r"review-(?:exit-)?(\d{12,})", case_file.stem)
+    return int(m.group(1)) if m else None
+
+
+def time_travel(pdir: Path, cutoff_ms: int) -> dict:
+    """Roll a seed copy back to (approximately) the moment the review was written.
+
+    The seed is a snapshot of the store TODAY, which already holds what the
+    production reviews recorded from these very conversations. A reviewer
+    that searches before writing then (correctly) records nothing, and a
+    judge that only sees the writes scores that as missed recall. So, per
+    case: drop memories created on/after the review day, drop reinforcements
+    from that day on, drop skills created on/after it, and cut sessions from
+    the search index that started after the review. Skill/wiki content edits
+    cannot be rolled back (no history); that residue is the same for every
+    variant.
+    """
+    day = datetime.fromtimestamp(cutoff_ms / 1000).date().isoformat()
+    out = {"cutoff_day": day, "memories_dropped": 0, "reinforcements_dropped": 0,
+           "skills_dropped": [], "search_rows_dropped": 0}
+    mem = pdir / "memories.jsonl"
+    kept = []
+    for r in read_jsonl(mem):
+        if (r.get("created_at") or "0000") >= day:
+            out["memories_dropped"] += 1
+            continue
+        reinf = [d for d in (r.get("reinforcements") or []) if isinstance(d, str) and d < day]
+        out["reinforcements_dropped"] += len(r.get("reinforcements") or []) - len(reinf)
+        r["reinforcements"] = reinf
+        r["last_reinforced"] = reinf[-1] if reinf else r.get("created_at")
+        kept.append(r)
+    mem.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept), encoding="utf-8")
+    usage_f = pdir / "skills" / ".usage.json"
+    try:
+        usage = json.loads(usage_f.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        usage = {}
+    for name, meta in list(usage.items()):
+        if (meta.get("created_at") or "0000") >= day:
+            shutil.rmtree(pdir / "skills" / name, ignore_errors=True)
+            usage.pop(name)
+            out["skills_dropped"].append(name)
+    if usage_f.exists():
+        usage_f.write_text(json.dumps(usage, indent=2, ensure_ascii=False), encoding="utf-8")
+    db = pdir / "search.db"
+    if db.exists():
+        import sqlite3
+        con = sqlite3.connect(str(db))
+        try:
+            cur = con.execute("DELETE FROM session_text_content WHERE timestamp >= ?", [cutoff_ms])
+            out["search_rows_dropped"] = cur.rowcount
+            con.execute("DELETE FROM indexed_session WHERE time_created >= ?", [cutoff_ms])
+            con.execute("INSERT INTO session_text(session_text) VALUES('rebuild')")
+            con.commit()
+        except sqlite3.Error as exc:
+            out["search_error"] = str(exc)
+        finally:
+            con.close()
+    # The composed views are rebuilt by the variant's deploy step.
+    for f in ("memory.context.md", "memory.archive.json"):
+        (pdir / f).unlink(missing_ok=True)
+    return out
+
+
+def known_context(before: dict, conversation: str, limit: int = 12) -> str:
+    """Store entries relevant to the conversation BEFORE the review (shared by
+    all variants): what a reviewer could have found already recorded."""
+    import memlayers
+    recs = [r for r in before["memories"].values() if r.get("status") == "active"]
+    hits = memlayers.search(recs, conversation[:20000], limit=limit, layer=None, min_overlap=2)
+    lines = [f"- [{r.get('type')}] {r.get('text', '')[:300]}" for _, r in hits]
+    skills = [n for n in before["skills"] if n.lower() in conversation.lower()]
+    out = "### Relevant entries already in the store\n" + ("\n".join(lines) if lines else "- none")
+    out += "\n\n### Skills that existed (mentioned in the conversation)\n" + (", ".join(skills) if skills else "none")
+    return out + "\n"
+
+
 def run_case(case_file: Path, variant: str, skill_dir: Path, seed: Path, run_dir: Path,
-             model: str | None, timeout_s: int, dry_run: bool) -> dict:
+             model: str | None, timeout_s: int, dry_run: bool, travel: bool = True) -> dict:
     case = case_file.stem
     sb = run_dir / variant / case
     if (sb / "result.json").exists():
@@ -441,6 +519,9 @@ def run_case(case_file: Path, variant: str, skill_dir: Path, seed: Path, run_dir
     pdir = home / "personas" / "default"
     copy_tree(seed / "al", home)
     copy_tree(seed / "agent-improvement", sb / "agent-improvement")
+    travel_info = None
+    if travel and review_time_ms(case_file):
+        travel_info = time_travel(pdir, review_time_ms(case_file))
     (sb / "project").mkdir(parents=True, exist_ok=True)
     agents_md = None
     if (seed / "AGENTS.md").exists():
@@ -467,7 +548,9 @@ def run_case(case_file: Path, variant: str, skill_dir: Path, seed: Path, run_dir
     msg = build_message(review_text, skill_dir, home)
     (sb / "message.md").write_text(msg, encoding="utf-8")
     write_sandbox_config(sb / "xdg-config", sb, skill_dir, model, agents_md)
-    result = {"case": case, "variant": variant, "prep_rc": prep.returncode, "prep_err": prep.stderr[-500:]}
+    (sb / "known.md").write_text(known_context(before, conversation_of(review_text)), encoding="utf-8")
+    result = {"case": case, "variant": variant, "prep_rc": prep.returncode, "prep_err": prep.stderr[-500:],
+              "time_travel": travel_info}
     t0 = time.time()
     rc, timed_out = None, False
     if not dry_run:
@@ -519,13 +602,14 @@ def cmd_run(args) -> None:
     if args.cases:
         cases = [c for c in cases if c in set(args.cases.split(","))]
     meta = {"corpus": str(corpus), "variants": {n: (run_dir / f"src-{n}" / "REF").read_text().strip() for n in variants},
-            "model": args.model, "cases": cases, "started_at": datetime.now().isoformat(timespec="seconds")}
+            "model": args.model, "cases": cases, "time_travel": not args.no_time_travel,
+            "started_at": datetime.now().isoformat(timespec="seconds")}
     (run_dir / "run.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     jobs = [(c, v) for c in cases for v in variants]
     print(f"run {run_id}: {len(cases)} cases x {len(variants)} variants = {len(jobs)} reviewer runs -> {run_dir}")
     with cf.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         futs = {pool.submit(run_case, corpus / "cases" / f"{c}.md", v, variants[v], corpus / "seed", run_dir,
-                            args.model, args.timeout, args.dry_run): (c, v) for c, v in jobs}
+                            args.model, args.timeout, args.dry_run, not args.no_time_travel): (c, v) for c, v in jobs}
         for fut in cf.as_completed(futs):
             c, v = futs[fut]
             try:
@@ -656,6 +740,8 @@ def main() -> None:
     r.add_argument("--run-id", default=None, help="resume / name a run (completed cases are skipped)")
     r.add_argument("--out", default=str(EVAL_ROOT / "runs"))
     r.add_argument("--dry-run", action="store_true", help="build sandboxes + prompts, do not call the model")
+    r.add_argument("--no-time-travel", action="store_true",
+                   help="seed every case with today's store (default: roll the seed back to the review's date)")
     rep = sub.add_parser("report", help="Aggregate a run (and judge results) into report.md")
     rep.add_argument("--run", required=True)
     args = ap.parse_args()

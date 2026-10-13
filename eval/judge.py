@@ -39,13 +39,18 @@ RUBRIC = """You are evaluating two automated "learning reviewers". Each read the
 user and a coding agent, and wrote durable knowledge (memories, user preferences, skill changes) that will
 be fed to FUTURE agent sessions. Judge which reviewer would make future sessions better.
 
+You are also shown what the store ALREADY contained before the review. Both reviewers started from that
+same store.
+
 Score each reviewer from 1 (poor) to 5 (excellent) on:
-- recall: did it capture the conversation's real durable signals (user corrections, stated preferences or
-  workflow specs, workarounds that worked, root-caused failures)? Missing a clear correction is serious.
+- recall: did it capture the conversation's real durable signals that were NOT already in the store (user
+  corrections, stated preferences or workflow specs, workarounds that worked, root-caused failures)?
+  Missing a clear NEW correction is serious. Not re-recording something already stored is NOT a miss.
 - precision: did it avoid noise (one-off task details, transient errors, restating the conversation,
-  speculative or over-generalized rules)? Writing nothing when nothing durable happened is CORRECT.
-- curation: did it fold new knowledge into existing entries (strengthen / edit) instead of adding
-  near-duplicates or "supersedes" layers? Are entries concise and actionable?
+  speculative or over-generalized rules)? Writing nothing when nothing new and durable happened is CORRECT.
+- curation: did it fold knowledge into existing entries (strengthen / edit) instead of adding
+  near-duplicates of what the store already held, or "supersedes" layers? Are entries concise and
+  actionable? Re-adding a known fact as a new entry is a curation flaw.
 - correctness: is what it wrote true to the conversation and safe to act on?
 - skill_handling: were skill changes justified by evidence in the conversation and minimal? Editing a
   skill that the conversation never used, or appending history instead of fixing the text, is poor.
@@ -61,9 +66,10 @@ Answer with ONLY a JSON object, no prose before or after:
 """
 
 
-def build_prompt(conversation: str, changes_a: str, changes_b: str, max_conv: int) -> str:
+def build_prompt(conversation: str, changes_a: str, changes_b: str, max_conv: int, known: str = "") -> str:
     conv = conversation if len(conversation) <= max_conv else conversation[:max_conv // 2] + "\n\n[... middle truncated ...]\n\n" + conversation[-max_conv // 2:]
-    return (RUBRIC + "\n\n# Conversation\n\n" + conv + "\n\n# Reviewer A wrote\n\n" + changes_a +
+    return (RUBRIC + "\n\n# Already in the store before the review (shared by both)\n\n" + (known or "(not available)") +
+            "\n\n# Conversation\n\n" + conv + "\n\n# Reviewer A wrote\n\n" + changes_a +
             "\n\n# Reviewer B wrote\n\n" + changes_b + "\n")
 
 
@@ -141,10 +147,12 @@ def main() -> None:
                 continue
             conv = replay.conversation_of((corpus / "cases" / f"{case}.md").read_text(encoding="utf-8", errors="replace"))
             changes = {v: p.read_text(encoding="utf-8") for v, p in zip(variants, paths)}
+            known_f = paths[0].parent / "known.md"
+            known = known_f.read_text(encoding="utf-8") if known_f.exists() else ""
             orders = [variants[:], variants[::-1]] if args.both_orders else [rng.sample(variants, 2)]
             verdicts = []
             for a, b in orders:
-                v, raw = judge_once(build_prompt(conv, changes[a], changes[b], args.max_conversation_chars),
+                v, raw = judge_once(build_prompt(conv, changes[a], changes[b], args.max_conversation_chars, known),
                                     args.model, workdir, args.timeout)
                 if v is None:
                     verdicts.append({"order": [a, b], "error": raw})

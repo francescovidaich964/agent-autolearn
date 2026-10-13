@@ -119,3 +119,42 @@ def test_external_dirs_emits_native_and_posix_patterns(tmp_path):
     assert list(rules)[0] == "*" and rules["*"] == "deny"          # catch-all first: last match wins
     assert rules[str(tmp_path) + replay.os.sep + "*"] == "allow"
     assert rules[replay.posix(tmp_path) + "/*"] == "allow"
+
+
+def test_time_travel_rolls_seed_back(tmp_path):
+    import sqlite3
+    from datetime import datetime as dt
+    pdir = tmp_path
+    (pdir / "skills" / "old-skill").mkdir(parents=True)
+    (pdir / "skills" / "new-skill").mkdir(parents=True)
+    (pdir / "skills" / ".usage.json").write_text(json.dumps({
+        "old-skill": {"created_at": "2026-09-01"}, "new-skill": {"created_at": "2026-10-05"}}), encoding="utf-8")
+    (pdir / "memories.jsonl").write_text("\n".join(json.dumps(r) for r in [
+        {"id": "a", "text": "before", "created_at": "2026-09-20", "reinforcements": ["2026-09-25", "2026-10-02"], "status": "active"},
+        {"id": "b", "text": "same day", "created_at": "2026-10-01", "reinforcements": [], "status": "active"},
+        {"id": "c", "text": "after", "created_at": "2026-10-07", "reinforcements": [], "status": "active"},
+    ]) + "\n", encoding="utf-8")
+    con = sqlite3.connect(str(pdir / "search.db"))
+    con.executescript("""
+        CREATE TABLE session_text_content(rowid INTEGER PRIMARY KEY, session_id TEXT, message_id TEXT, role TEXT,
+            text TEXT, project TEXT DEFAULT '', timestamp INTEGER);
+        CREATE VIRTUAL TABLE session_text USING fts5(session_id, message_id, role, text, project, timestamp,
+            content=session_text_content, content_rowid=rowid);
+        CREATE TABLE indexed_session(session_id TEXT PRIMARY KEY, title TEXT, project TEXT, message_count INTEGER,
+            time_created INTEGER, time_indexed INTEGER);
+    """)
+    cutoff = int(dt(2026, 10, 1, 12, 0).timestamp() * 1000)
+    for i, ts in enumerate([cutoff - 10_000, cutoff + 10_000], 1):
+        con.execute("INSERT INTO session_text_content VALUES (?,?,?,?,?,?,?)", (i, f"s{i}", "m", "user", "gpg passphrase", "", ts))
+    con.execute("INSERT INTO session_text(session_text) VALUES('rebuild')")
+    con.commit()
+    con.close()
+    info = replay.time_travel(pdir, cutoff)
+    kept = [json.loads(l) for l in (pdir / "memories.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [r["id"] for r in kept] == ["a"] and kept[0]["reinforcements"] == ["2026-09-25"]
+    assert info["skills_dropped"] == ["new-skill"] and not (pdir / "skills" / "new-skill").exists()
+    con = sqlite3.connect(str(pdir / "search.db"))
+    hits = con.execute("SELECT c.session_id FROM session_text s JOIN session_text_content c ON c.rowid=s.rowid "
+                       "WHERE session_text MATCH 'gpg'").fetchall()
+    con.close()
+    assert hits == [("s1",)] and info["search_rows_dropped"] == 1
