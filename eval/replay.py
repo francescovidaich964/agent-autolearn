@@ -68,6 +68,7 @@ SEED_FILES = ["memories.jsonl", "config.yaml", "proposals.json", "observations.j
 SEED_DIRS = ["skills", "wiki"]
 DUP_CFG = {"dedupe_jaccard": 0.4, "dedupe_containment": 0.8, "dedupe_min_tokens": 5}
 OPENCODE = os.environ.get("AUTOLEARN_REPLAY_OPENCODE", "opencode")
+REPLAY_STEPS = 20  # same budget as the production autolearn-reviewer agent
 
 REPLAY_AGENT_PROMPT = (
     "You are the autolearn review agent running in a sandbox. Follow the reviewer protocol appended "
@@ -271,7 +272,7 @@ def write_sandbox_config(xdg: Path, sb: Path, skill_dir: Path, model: str | None
     allowed = external_dirs(sb, skill_dir.parents[1])
     cfg["permission"] = {"external_directory": allowed}
     cfg["agent"] = {"autolearn-replay": {
-        "description": "Replays an autolearn review in a sandbox", "hidden": True, "steps": 20,
+        "description": "Replays an autolearn review in a sandbox", "hidden": True, "steps": REPLAY_STEPS,
         "prompt": REPLAY_AGENT_PROMPT,
         "permission": {"bash": "allow", "read": "allow", "glob": "allow", "grep": "allow", "write": "allow",
                        "edit": "deny", "webfetch": "deny", "task": "deny", "skill": "deny",
@@ -416,7 +417,9 @@ def run_events_stats(events_path: Path) -> dict:
             "errors": sum(1 for e in evs if e.get("type") == "error"),
             "tokens_in": tin, "tokens_out": tout, "cost": round(cost, 6),
             "final_text": (texts[-1] if texts else "")[:1500], "session_id": sid,
-            "hit_step_limit": bool(fins) and (fins[-1].get("part") or {}).get("reason") not in ("stop", "end_turn", None)}
+            # OpenCode ends a capped run with a normal-looking final step, so
+            # the reason field cannot tell; the step count can.
+            "hit_step_limit": len(fins) >= REPLAY_STEPS}
 
 
 def live_leak_check() -> bool:

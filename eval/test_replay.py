@@ -93,6 +93,10 @@ def test_run_events_stats(tmp_path):
     s = replay.run_events_stats(ev)
     assert s["steps"] == 2 and s["tool_calls"] == 1 and s["tokens_in"] == 150 and s["session_id"] == "ses_1"
     assert not s["hit_step_limit"] and "nothing to record" in s["final_text"]
+    capped = tmp_path / "capped.jsonl"
+    capped.write_text("\n".join(json.dumps({"type": "step_finish", "part": {"reason": "stop"}})
+                                for _ in range(replay.REPLAY_STEPS)), encoding="utf-8")
+    assert replay.run_events_stats(capped)["hit_step_limit"]
 
 
 @pytest.mark.parametrize("text,ok", [
