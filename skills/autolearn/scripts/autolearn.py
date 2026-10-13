@@ -60,6 +60,11 @@ except ImportError:  # cryptography only needed for sync; module stays importabl
 # consoles (e.g. Windows cp1252). Sibling module in the same scripts dir.
 import stdio_guard
 
+# Cross-process store lock + atomic writes (RL-INT-001..003).
+import storelock
+# Write-time prompt-injection / secret scan (RL-INT-005).
+import safety
+
 # Memory Insight subsystem (registry + retention + composer + shift + ui).
 # These are siblings in the same scripts dir; imported here so the CLI can
 # dispatch to them. See docs/designs/memory-insight/LLD.md.
@@ -104,6 +109,10 @@ USAGE_FILE = SKILLS_DIR / ".usage.json"
 CURATOR_STATE_FILE = ACTIVE_PERSONA_DIR / ".curator_state.json"
 OBSERVATIONS_FILE = ACTIVE_PERSONA_DIR / "observations.jsonl"
 AGENTS_SKILLS_DIR = Path(os.environ.get("AGENTS_SKILLS_DIR", Path.home() / ".agents" / "skills"))
+
+# Stamped on observations so metrics can split before/after windows of a
+# design change (eval/store_report.py). Mirrors DESIGN_VERSION in the plugin.
+DESIGN_VERSION = "rl-2026.10"
 
 MAX_MEMORY_CHARS = 3000
 MAX_USER_CHARS = 2000
@@ -269,10 +278,27 @@ def load_usage() -> dict:
 
 def save_usage(data: dict):
     ensure_dirs()
-    USAGE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    storelock.atomic_write_text(USAGE_FILE, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def store_lock():
+    """Cross-process lock for the ACTIVE persona store (RL-INT-001)."""
+    return storelock.store_lock(ACTIVE_PERSONA_DIR)
+
+
+def _locked(fn):
+    """Run ``fn`` under the active persona's store lock (resolved at call time)."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with store_lock():
+            return fn(*a, **kw)
+    return wrapper
 
 
 # @spec CP-OUT-005, CP-INT-001, SM-LC-013, SM-LC-014, SM-LC-015, SM-LC-016
+@_locked
 def repair_skill_use_counts() -> dict:
     """Write skill load signals (derived from the outcome index) into .usage.json.
 
@@ -429,6 +455,7 @@ def cmd_proposals_scan(args):
 
 
 # @spec LH-PROP-003 — auto-promote verified proposals to skills (gated by falsify)
+@_locked
 def promote_proposals() -> dict:
     """Create skills for proposals whose common_resolution passed falsification.
 
@@ -504,6 +531,7 @@ def promote_proposals() -> dict:
 
 
 # @spec LH-PRUNE-001 — never-used pruner (use_count × age)
+@_locked
 def prune_unused_skills(config: dict) -> dict:
     """Auto-archive autolearn-created skills with use_count==0 past the grace period.
 
@@ -621,8 +649,8 @@ def load_curator_state() -> dict:
 
 def save_curator_state(state: dict):
     ensure_dirs()
-    CURATOR_STATE_FILE.write_text(
-        json.dumps(state, indent=2, ensure_ascii=False) + "\n"
+    storelock.atomic_write_text(
+        CURATOR_STATE_FILE, json.dumps(state, indent=2, ensure_ascii=False) + "\n"
     )
 
 
@@ -714,16 +742,51 @@ def refresh_context():
         reg = memory_registry()
         md = composer.compose(reg, set())
         out = ACTIVE_PERSONA_DIR / "memory.context.md"
-        tmp = out.with_suffix(out.suffix + f".{os.getpid()}.tmp")
-        tmp.write_text(md, encoding="utf-8")
-        os.replace(tmp, out)
+        storelock.atomic_write_text(out, md)
     except Exception:
         pass  # context refresh must never break a memory write
+
+
+def log_observation(entry: dict) -> None:
+    """Append one event to observations.jsonl (locked append + trim)."""
+    entry.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+    entry.setdefault("design", DESIGN_VERSION)
+    review_id = os.environ.get("AUTOLEARN_REVIEW_ID")
+    if review_id:
+        entry.setdefault("review_id", review_id)
+    with store_lock():
+        storelock.append_line(OBSERVATIONS_FILE, json.dumps(entry, ensure_ascii=False))
+        trim_jsonl(OBSERVATIONS_FILE, 1000)
+
+
+# @spec RL-INT-005
+def guard_text(text: str, kind: str) -> None:
+    """Refuse content that looks like prompt injection or a secret.
+
+    Memory and skills are injected into every future session, so the store
+    must never persist instructions smuggled in through transcripts.
+    """
+    findings = safety.scan(text or "")
+    if not findings:
+        return
+    blocked = safety.blocking(findings)
+    log_observation({
+        "type": "write_blocked" if blocked else "write_warned",
+        "kind": kind,
+        "rules": sorted({f["rule"] for f in findings}),
+    })
+    for f in findings:
+        print(f"[safety:{f['verdict']}] {f['rule']}: {f['excerpt']}", file=sys.stderr)
+    if blocked:
+        print("Refused: the text looks like a prompt-injection payload or contains a "
+              "secret. Record the lesson in plain words without it.", file=sys.stderr)
+        sys.exit(3)
 
 
 # @spec MI-REG-015, MI-CMP-009
 def cmd_memory_add(args):
     ensure_dirs()
+    guard_text(args.content, "memory")
     reg = memory_registry()
     rec = reg.add(args.content, "memory")
     refresh_context()
@@ -847,9 +910,7 @@ def cmd_memory_compose(args):
     ctx = composer.tokens(args.context) if getattr(args, "context", None) else set()
     md = composer.compose(reg, ctx)
     out = ACTIVE_PERSONA_DIR / "memory.context.md"
-    tmp = out.with_suffix(out.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(md, encoding="utf-8")
-    os.replace(tmp, out)
+    storelock.atomic_write_text(out, md)
     n = max(0, md.count("\n- "))
     print(f"Wrote {out} ({n} entries, {len(md)} chars)")
 
@@ -879,6 +940,7 @@ def cmd_topics_candidates(args):
 # @spec KS-MEM-004, KS-MEM-005, MI-REG-015  (user profile now lives in the registry, type="user")
 def cmd_user_add(args):
     ensure_dirs()
+    guard_text(args.content, "user")
     reg = memory_registry()
     reg.add(args.content, "user")
     refresh_context()
@@ -910,6 +972,7 @@ def cmd_skill_create(args):
     ensure_dirs()
     name = slugify(args.name)
     desc = args.description
+    guard_text(desc, "skill")
     skill_dir = SKILLS_DIR / name
     skill_file = skill_dir / "SKILL.md"
 
@@ -976,6 +1039,7 @@ def cmd_skill_patch(args):
     name = slugify(args.name)
     section = args.section
     content = args.content
+    guard_text(f"{section}\n{content}", "skill")
     skill_file = SKILLS_DIR / name / "SKILL.md"
 
     if not skill_file.exists():
@@ -1098,21 +1162,9 @@ def cmd_skill_usage(args):
     print(json.dumps(usage, indent=2))
 
 
-# @spec SM-LC-001, SM-LC-002, SM-LC-003, SM-LC-004
-# @spec SM-LC-005, SM-LC-006, SM-LC-007, SM-LC-017
-# @spec SM-LC-008, SM-LC-009, SM-LC-011, SM-LC-012
-def cmd_curator_run(args):
-    config = load_config()
-    stale_days = config.get("stale_after_days", 30)
-    archive_days = config.get("archive_after_days", 90)
-    escalation_threshold = config.get("escalation_threshold", 3)
-    today = date.today()
-
-    usage = load_usage()
-    state = load_curator_state()
-
+def _lifecycle_transitions(usage: dict, stale_days: int, archive_days: int, today) -> dict:
+    """Inactivity-driven active -> stale -> archived transitions (mutates ``usage``)."""
     transitions = {"stale": [], "archived": [], "active": []}
-
     for name, meta in list(usage.items()):
         if meta.get("state") == "archived":
             continue
@@ -1143,8 +1195,30 @@ def cmd_curator_run(args):
         elif days_inactive >= stale_days and current_state == "active":
             meta["state"] = "stale"
             transitions["stale"].append(name)
+    return transitions
 
-    save_usage(usage)
+
+# @spec SM-LC-001, SM-LC-002, SM-LC-003, SM-LC-004
+# @spec SM-LC-005, SM-LC-006, SM-LC-007, SM-LC-017
+# @spec SM-LC-008, SM-LC-009, SM-LC-011, SM-LC-012
+def cmd_curator_run(args):
+    config = load_config()
+    stale_days = config.get("stale_after_days", 30)
+    archive_days = config.get("archive_after_days", 90)
+    escalation_threshold = config.get("escalation_threshold", 3)
+    today = date.today()
+
+    # RL-INT-003: crashed writers leave pid-suffixed tmp files behind.
+    try:
+        storelock.sweep_tmp(ACTIVE_PERSONA_DIR)
+    except Exception:
+        pass
+
+    with store_lock():
+        usage = load_usage()
+        transitions = _lifecycle_transitions(usage, stale_days, archive_days, today)
+        save_usage(usage)
+    state = load_curator_state()
 
     escalation_candidates = []
     # Memory Insight: escalation is driven by registry reinforcement counts
@@ -1168,9 +1242,10 @@ def cmd_curator_run(args):
         cp["indexed"] = {"error": str(exc)}
     try:
         summary = falsify.verify_all(SKILLS_DIR, ACTIVE_PERSONA_DIR / falsify.VERDICTS_FILE)
-        usage = load_usage()
-        cons = falsify.apply_consequences(usage, summary["ledger"])
-        save_usage(usage)
+        with store_lock():
+            usage = load_usage()
+            cons = falsify.apply_consequences(usage, summary["ledger"])
+            save_usage(usage)
         cp["falsify"] = {k: summary[k] for k in ("pass", "fail", "inconclusive")}
         cp["falsify"]["demoted"] = len(cons["demoted"])
         # @spec WIKI-IMP-002 — demotions are harness-recorded verdicts
@@ -1221,9 +1296,11 @@ def cmd_curator_run(args):
         "certified_procedures": cp,
         "long_horizon": lh,
     }
-    state["last_run"] = today.isoformat()
-    state["runs"].append(run_record)
-    save_curator_state(state)
+    with store_lock():
+        state = load_curator_state()
+        state["last_run"] = today.isoformat()
+        state["runs"].append(run_record)
+        save_curator_state(state)
 
     total_transitions = sum(len(v) for v in transitions.values())
     cp_fail = cp.get("falsify", {})
@@ -1724,11 +1801,9 @@ def cmd_search_status(args):
 def trim_jsonl(path: Path, max_lines: int = 1000):
     """Trim a JSONL file to the last max_lines entries."""
     try:
-        content = path.read_text()
-        lines = content.strip().split("\n") if content.strip() else []
-        if len(lines) > max_lines:
-            path.write_text("\n".join(lines[-max_lines:]) + "\n")
-    except (OSError, IndexError):
+        with storelock.store_lock(path.parent):
+            storelock.trim_lines(path, max_lines)
+    except (OSError, IndexError, storelock.StoreLockTimeout):
         pass
 
 
@@ -1756,10 +1831,7 @@ def cmd_log_review_complete(args):
         topics_raw = getattr(args, "topics", "") or ""
         entry["topics"] = [t.strip() for t in topics_raw.split(",") if t.strip()]
 
-    with open(OBSERVATIONS_FILE, "a") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-    trim_jsonl(OBSERVATIONS_FILE, 1000)
+    log_observation(entry)
 
     if entry.get("nothing_recorded"):
         print("Logged: review_complete (nothing recorded)")
@@ -2307,6 +2379,9 @@ def cmd_sync_status(args):
     print(f"Machine ID: {sync_crypto.machine_id()}")
 
 
+LOCKED_COMMANDS = {"memory", "user", "skill", "log"}
+
+
 def main():
     stdio_guard.reconfigure_stdio()
     parser = argparse.ArgumentParser(
@@ -2607,7 +2682,14 @@ def main():
         fn = cmd_map.get(subcmd)
         if fn:
             ensure_dirs()
-            fn(args)
+            # Short store-mutating commands run under the store lock as a
+            # whole so their load -> modify -> save sequences (usage ledger,
+            # registry, observations) are atomic across processes.
+            if args.command in LOCKED_COMMANDS:
+                with store_lock():
+                    fn(args)
+            else:
+                fn(args)
         else:
             print(f"Unknown subcommand: {args.command} {subcmd}")
             sys.exit(1)

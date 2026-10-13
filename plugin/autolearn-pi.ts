@@ -72,7 +72,7 @@ export default function autolearnPi(pi: ExtensionAPI) {
   let memoryAppended = false
   let cwd = process.cwd()
 
-  const projectName = () => cwd.split("/").pop() || "unknown"
+  const projectName = () => core.projectLabel(cwd)
 
   // Extract plain text from a pi message `content` (string or content blocks).
   function textOf(content: any): string {

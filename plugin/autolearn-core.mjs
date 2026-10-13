@@ -30,6 +30,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -82,6 +83,9 @@ export const IDLE_COOLDOWN_MS = 300000
 export const MIN_INTERVAL_DEFAULT_MS = 180000 // 3 min between review starts, global (serializes bursts; dedupe handles same-content)
 export const MAX_REVIEWS_PER_DAY_DEFAULT = 60 // hard ceiling across all projects (~2.5/hr sustained)
 export const REVIEW_HEADING = "# Autolearn Review"
+// Stamped on observations and review files so metrics can split the
+// before/after windows of a design change (eval/store_report.py).
+export const DESIGN_VERSION = "rl-2026.10"
 export const DEBUG = process.env.AUTOLEARN_DEBUG === "1"
 export const DBG_FILE = join(AL_HOME, "debug.log")
 
@@ -99,6 +103,82 @@ export const SECRET_RE =
 export function redact(str) {
   if (!str) return str
   return str.replace(SECRET_RE, "$1$2$3[REDACTED]")
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process store lock (RL-INT-001). Same protocol as storelock.py: an
+// atomic mkdir of <persona>/.store.lock/, broken when older than 120 s. The
+// plugin runs inside the harness process, so it never waits long: after
+// `timeoutMs` it logs and proceeds unlocked rather than stall the host.
+export const STORE_LOCK_DIR = join(DEFAULT_PERSONA_DIR, ".store.lock")
+export const STORE_LOCK_STALE_MS = 120000
+
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } catch {}
+}
+
+export function withStoreLock(fn, { timeoutMs = 2000, lockDir = STORE_LOCK_DIR } = {}) {
+  const deadline = Date.now() + timeoutMs
+  let delay = 5
+  let held = false
+  for (;;) {
+    try {
+      mkdirSync(lockDir)
+      held = true
+      break
+    } catch (err) {
+      if (err.code !== "EEXIST" && err.code !== "EPERM") {
+        if (err.code === "ENOENT") { try { mkdirSync(join(lockDir, ".."), { recursive: true }) } catch {} ; continue }
+        break
+      }
+      try {
+        if (Date.now() - statSync(lockDir).mtimeMs > STORE_LOCK_STALE_MS) {
+          const grave = `${lockDir}.stale.${process.pid}.${Date.now()}`
+          try { renameSync(lockDir, grave); rmSync(grave, { recursive: true, force: true }) } catch {}
+          continue
+        }
+      } catch {}
+      if (Date.now() >= deadline) { dbg("store lock busy, proceeding unlocked"); break }
+      sleepSync(delay)
+      delay = Math.min(delay * 2, 100)
+    }
+  }
+  if (held) {
+    try { writeFileSync(join(lockDir, "owner"), `${process.pid} ${Math.floor(Date.now() / 1000)} js\n`) } catch {}
+  }
+  try {
+    return fn()
+  } finally {
+    if (held) { try { rmSync(lockDir, { recursive: true, force: true }) } catch {} }
+  }
+}
+
+// RL-INT-003: writers killed between write and rename leave pid-suffixed
+// *.tmp files; sweep the ones older than an hour on every plugin load.
+export function sweepTmp(dirs = [DEFAULT_PERSONA_DIR, SKILLS_DIR], maxAgeMs = 3600000) {
+  const removed = []
+  const now = Date.now()
+  for (const dir of dirs) {
+    let names = []
+    try { names = readdirSync(dir) } catch { continue }
+    for (const f of names) {
+      if (!f.endsWith(".tmp")) continue
+      const p = join(dir, f)
+      try {
+        if (now - statSync(p).mtimeMs > maxAgeMs) { unlinkSync(p); removed.push(f) }
+      } catch {}
+    }
+  }
+  if (removed.length) dbg("SWEPT orphaned tmp files", removed)
+  return removed
+}
+
+// RL-INT-004: project label from a working directory on any platform. The
+// shells used `.split("/")`, which returns the whole path on Windows and
+// broke every per-project scope.
+export function projectLabel(dir) {
+  const parts = String(dir || "").replace(/[\\/]+$/, "").split(/[\\/]/)
+  return parts.pop() || "unknown"
 }
 
 // @spec KS-MEM-001 (ensures directory tree exists before any operation)
@@ -120,6 +200,7 @@ export function ensureStore() {
   }
   ensureWrapper()
   ensureLauncher()
+  sweepTmp()
 }
 
 // Phase 3 migration: move flat ~/.autolearn/ files to personas/default/
@@ -579,11 +660,16 @@ export const MAX_OBS_LINES = 1000
 // @spec KS-OBS-001, KS-OBS-002, KS-OBS-003
 export function logObs(obs) {
   obs.timestamp = new Date().toISOString()
+  if (!obs.design) obs.design = DESIGN_VERSION
   try {
-    // @spec KS-OBS-005
-    appendFileSync(OBS_FILE, JSON.stringify(obs) + "\n")
-    // @spec KS-OBS-004
-    trimFile(OBS_FILE, MAX_OBS_LINES)
+    // Append + trim under the store lock: the Python CLI appends and trims
+    // the same file, and an unlocked trim silently drops concurrent appends.
+    withStoreLock(() => {
+      // @spec KS-OBS-005
+      appendFileSync(OBS_FILE, JSON.stringify(obs) + "\n")
+      // @spec KS-OBS-004
+      trimFile(OBS_FILE, MAX_OBS_LINES)
+    })
   } catch {
     // @spec KS-OBS-006
   }
@@ -596,7 +682,9 @@ export function trimFile(filePath, maxLines) {
     const lines = content.split("\n")
     if (lines.length <= maxLines) return
     const trimmed = lines.slice(-maxLines).join("\n")
-    writeFileSync(filePath, trimmed)
+    const tmp = `${filePath}.${process.pid}.tmp`
+    writeFileSync(tmp, trimmed)
+    renameSync(tmp, filePath)
     dbg("TRIMMED", filePath, "from", lines.length, "to", maxLines, "lines")
   } catch {}
 }

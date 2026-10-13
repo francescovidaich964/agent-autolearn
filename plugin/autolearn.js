@@ -56,7 +56,7 @@ export const AutolearnPlugin = async (ctx) => {
   const messageTexts = new Map()
   const messageRoles = new Map()
 
-  const projectName = () => (directory || worktree || process.cwd()).split("/").pop() || "unknown"
+  const projectName = () => core.projectLabel(directory || worktree || process.cwd())
   // Reviewer sessions run in a scratch directory, not the workspace: harness
   // UIs that list sessions per workspace cwd (e.g. Devin Desktop Spaces via
   // ACP session/list) would otherwise surface every review as a conversation.

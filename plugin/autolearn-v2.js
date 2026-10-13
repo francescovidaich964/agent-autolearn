@@ -47,7 +47,7 @@ export default {
     core.ensureStore()
     let config = core.parseConfig()
     const directory = ctx?.location?.directory || ctx?.directory || process.cwd()
-    const projectName = () => String(directory).split("/").pop() || "unknown"
+    const projectName = () => core.projectLabel(directory)
 
     core.dbg("PLUGIN LOADED (v2)", { directory, version: ctx?.app?.version })
 

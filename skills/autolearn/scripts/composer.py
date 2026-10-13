@@ -12,6 +12,8 @@ import os
 import re
 from pathlib import Path
 
+import storelock
+
 import registry
 from registry import MemoryRegistry
 
@@ -94,9 +96,7 @@ def cmd_compose(args):
 
     md = compose(reg, ctx_tokens)
     out_path = persona_dir / "memory.context.md"
-    tmp = out_path.with_suffix(out_path.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(md, encoding="utf-8")
-    os.replace(tmp, out_path)
+    storelock.atomic_write_text(out_path, md)
 
     n_entries = max(0, md.count("\n- "))
     print(f"Wrote {out_path} ({n_entries} entries, {len(md)} chars)")

@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import registry
+import storelock
 from registry import MemoryRegistry
 
 DEFAULT_PORT = 4321
@@ -77,11 +78,8 @@ def load_candidates(pdir: Path, status: str | None) -> list[dict]:
 
 def save_candidates(pdir: Path, candidates: list[dict]) -> None:
     path = pdir / "candidates.jsonl"
-    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        for c in candidates:
-            fh.write(json.dumps(c, ensure_ascii=False) + "\n")
-    os.replace(tmp, path)
+    storelock.atomic_write_text(
+        path, "".join(json.dumps(c, ensure_ascii=False) + "\n" for c in candidates))
 
 
 def load_skills(pdir: Path) -> dict:
