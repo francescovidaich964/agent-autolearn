@@ -3,6 +3,7 @@
 **Created**: 2026-10-13
 **Branch**: `feat/robust-learning-loop`
 **Design version tag**: `rl-2026.10` (stamped on observations so before/after windows separate)
+**Strategy and evaluation results**: [`../../robust-learning-loop.md`](../../robust-learning-loop.md)
 
 ## Why
 

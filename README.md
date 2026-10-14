@@ -172,9 +172,10 @@ auto_apply_rewrites: false    # let the curator apply its own staged rewrites
 # reviewer_model: provider/model   # run reviews on a different (cheaper/faster) model
 ```
 
-Evaluating a design change (store health snapshots, sandboxed A/B replay of
-real reviews, blind judge): see [`eval/README.md`](eval/README.md) and
-[`docs/designs/robust-learning-loop/LLD.md`](docs/designs/robust-learning-loop/LLD.md).
+The strategy behind these settings, and how it was evaluated against the
+previous design on real reviews: [`docs/robust-learning-loop.md`](docs/robust-learning-loop.md).
+Evaluating a design change yourself (store health snapshots, sandboxed A/B
+replay of real reviews, blind judge): [`eval/README.md`](eval/README.md).
 
 ## CLI reference
 
