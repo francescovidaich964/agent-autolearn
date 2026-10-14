@@ -31,7 +31,12 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCRIPTS = Path(__file__).resolve().parents[1] / "skills" / "autolearn" / "scripts"
+import os  # noqa: E402
+
+# AUTOLEARN_SCRIPTS lets a copy of this file outside the repo (e.g. a
+# scheduled weekly report) use the installed skill's modules.
+SCRIPTS = Path(os.environ.get("AUTOLEARN_SCRIPTS") or
+               Path(__file__).resolve().parents[1] / "skills" / "autolearn" / "scripts")
 sys.path.insert(0, str(SCRIPTS))
 import registry  # noqa: E402  (tokenization shared by both designs)
 import safety  # noqa: E402
@@ -327,6 +332,15 @@ HEADLINE = [
     ("skills.lint.oversized", "Oversized skills", "down"),
     ("skills.loaded_share", "Skills ever loaded (share)", "up"),
     ("skills.never_loaded_patched", "Never-loaded skills that got patched", "down"),
+    ("pipeline.events.archive_slice", "Sessions given a relevant archive slice", None),
+    ("pipeline.events.skill_edited", "Skill edits via `skill edit` (CLI)", None),
+    ("pipeline.events.skill_edited_in_session", "Skill-file edits seen in sessions", None),
+    ("pipeline.events.skill_proposed", "Skill proposals staged", None),
+    ("pipeline.events.skill_proposals_surfaced", "Proposals surfaced at skill load", None),
+    ("pipeline.events.skill_proposal_applied", "Proposals applied", None),
+    ("pipeline.events.write_refused", "Writes refused (duplicate / core full)", None),
+    ("pipeline.events.write_blocked", "Writes blocked by the safety scan", None),
+    ("pipeline.events.memories_retired", "Code-state retirement runs", None),
     ("integrity.orphan_tmp_files", "Orphaned tmp files", "down"),
     ("safety.blocked", "Blocking safety findings in injected content", "down"),
 ]
@@ -365,7 +379,25 @@ def main() -> None:
     c = sub.add_parser("compare")
     c.add_argument("before")
     c.add_argument("after")
+    t = sub.add_parser("track", help="Snapshot since a deploy date and write a dated comparison vs a baseline")
+    t.add_argument("--home", default=str(Path.home() / ".autolearn"))
+    t.add_argument("--baseline", required=True, help="Pre-deploy snapshot JSON")
+    t.add_argument("--since", required=True, help="Deploy date (ISO); only pipeline events from then on")
+    t.add_argument("--out-dir", required=True)
     args = ap.parse_args()
+    if args.cmd == "track":
+        out_dir = Path(args.out_dir).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        snap = snapshot(Path(args.home), args.since)
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        (out_dir / f"snapshot-{stamp}.json").write_text(json.dumps(snap, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        base = json.loads(Path(args.baseline).expanduser().read_text(encoding="utf-8"))
+        md = (f"# Autolearn production metrics — {stamp}\n\n"
+              f"Baseline: `{args.baseline}` (pre-deploy) · after: events since {args.since}\n\n"
+              + compare(base, snap) + "\n")
+        (out_dir / f"report-{stamp}.md").write_text(md, encoding="utf-8")
+        print(md)
+        return
     if args.cmd == "snapshot":
         snap = snapshot(Path(args.home), args.since)
         text = json.dumps(snap, indent=2, ensure_ascii=False)
