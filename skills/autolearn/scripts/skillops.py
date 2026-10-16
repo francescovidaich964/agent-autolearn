@@ -28,7 +28,7 @@ import json
 import re
 import sqlite3
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import storelock
@@ -290,6 +290,85 @@ def set_proposal_status(skills_root: Path, pid: str, status: str, **extra) -> di
             save_proposals(skills_root, items)
             return p
     raise SkillOpError(f"No proposal with id {pid}")
+
+
+def supersede_pending_rewrites(skills_root: Path, skill: str) -> list[str]:
+    """Mark pending rewrites of ``skill`` superseded; drop their staged files.
+
+    A rewrite is built from the current file, so the latest one supersedes any
+    pending one for the same skill (merging two full-file rewrites is not
+    meaningful). Called before staging a new rewrite.
+    """
+    items = load_proposals(skills_root)
+    superseded = []
+    for p in items:
+        if p.get("kind") == "rewrite" and p.get("skill") == skill and p.get("status") == "pending":
+            p["status"] = "superseded"
+            p["resolved_at"] = datetime.now().isoformat(timespec="seconds")
+            superseded.append(p["id"])
+            try:
+                (Path(skills_root) / ".proposals" / f"{p['id']}.md").unlink()
+            except OSError:
+                pass
+    if superseded:
+        save_proposals(skills_root, items)
+    return superseded
+
+
+def reject_conflicting_edits(skills_root: Path, skill: str, rewrite_id: str) -> list[str]:
+    """Reject pending edits of ``skill`` whose anchor text no longer exists.
+
+    Called after a rewrite is applied: an edit whose ``old`` text is gone from
+    the (new) file can never apply - its content is folded into the rewrite or
+    obsolete - so it is rejected with the rewrite as the reason.
+    """
+    items = load_proposals(skills_root)
+    rejected = []
+    for p in items:
+        if p.get("kind") != "edit" or p.get("skill") != skill or p.get("status") != "pending":
+            continue
+        try:
+            path = resolve_file(skills_root, skill, p.get("file"))
+            text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        except (SkillOpError, OSError):
+            text = ""
+        if str(p.get("old") or "").replace("\r\n", "\n") not in text:
+            p["status"] = "rejected"
+            p["resolved_at"] = datetime.now().isoformat(timespec="seconds")
+            p["reject_reason"] = f"superseded by rewrite {rewrite_id}"
+            rejected.append(p["id"])
+    if rejected:
+        save_proposals(skills_root, items)
+    return rejected
+
+
+def expire_stale_proposals(skills_root: Path, days: int) -> list[str]:
+    """Expire pending proposals older than ``days``; drop their staged files.
+
+    Dead proposals (a skill that never loads, an agent that never applies)
+    must not accumulate indefinitely.
+    """
+    items = load_proposals(skills_root)
+    cutoff = datetime.now() - timedelta(days=days)
+    expired = []
+    for p in items:
+        if p.get("status") != "pending":
+            continue
+        try:
+            created = datetime.fromisoformat(str(p.get("created_at")))
+        except ValueError:
+            continue
+        if created < cutoff:
+            p["status"] = "expired"
+            p["resolved_at"] = datetime.now().isoformat(timespec="seconds")
+            expired.append(p["id"])
+            try:
+                (Path(skills_root) / ".proposals" / f"{p['id']}.md").unlink()
+            except OSError:
+                pass
+    if expired:
+        save_proposals(skills_root, items)
+    return expired
 
 
 # ---------------------------------------------------------------------------

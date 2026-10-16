@@ -1305,6 +1305,7 @@ def cmd_skill_rewrite(args):
     report = skillops.preservation_report(cur, [new_text] + ref_texts)
     staged_dir = SKILLS_DIR / ".proposals"
     staged_dir.mkdir(parents=True, exist_ok=True)
+    superseded = skillops.supersede_pending_rewrites(SKILLS_DIR, name)
     prop = skillops.add_proposal(SKILLS_DIR, kind="rewrite", skill=name, file="SKILL.md",
                                  reason=args.reason, source=_role(), old_chars=len(cur), new_chars=len(new_text),
                                  missing=report["missing"][:50])
@@ -1313,6 +1314,8 @@ def cmd_skill_rewrite(args):
                      "role": _role(), "missing": len(report["missing"])})
     print(f"Staged rewrite proposal {prop['id']} for {name}: {len(cur)} -> {len(new_text)} chars; "
           f"{report['critical']} critical tokens, {len(report['missing'])} missing.")
+    if superseded:
+        print(f"Superseded pending rewrite(s): {', '.join(superseded)}")
     for t in report["missing"][:20]:
         print(f"  missing: {t}")
     print(f"Apply with: skill apply {prop['id']}" + ("" if not report["missing"] else
@@ -1376,6 +1379,15 @@ def cmd_skill_apply(args):
                      "proposal": prop["id"], "role": _role(), "delta_chars": res["delta_chars"]})
     _ledger("patch", name, f"[{prop['kind']} {prop['id']}] {(prop.get('reason') or '')[:240]}",
             trigger="curator" if _role() == "curator" else "review")
+    if prop["kind"] == "rewrite":
+        with store_lock():
+            rejected = skillops.reject_conflicting_edits(SKILLS_DIR, name, prop["id"])
+        for pid in rejected:
+            log_observation({"type": "skill_proposal_rejected", "skill": name, "kind": "edit",
+                             "proposal": pid, "role": _role(),
+                             "reason": f"superseded by rewrite {prop['id']}"})
+        if rejected:
+            print(f"Auto-rejected {len(rejected)} conflicting edit proposal(s): {', '.join(rejected)}")
     print(f"Applied {prop['kind']} proposal {prop['id']} to {name} ({res['delta_chars']:+d} chars); backup: {res['backup']}")
 
 
@@ -1690,6 +1702,11 @@ def cmd_curator_run(args):
         usage = load_usage()
         transitions = _lifecycle_transitions(usage, stale_days, archive_days, today)
         save_usage(usage)
+        try:
+            expired_proposals = skillops.expire_stale_proposals(
+                SKILLS_DIR, int(config.get("proposal_expiry_days", 30)))
+        except Exception:
+            expired_proposals = []
     state = load_curator_state()
 
     escalation_candidates = []
@@ -1762,6 +1779,7 @@ def cmd_curator_run(args):
     run_record = {
         "date": today.isoformat(),
         "transitions": transitions,
+        "proposals_expired": expired_proposals,
         "escalation_candidates": [
             {"entry": e, "strength": s} for e, s in escalation_candidates
         ],
@@ -1813,6 +1831,9 @@ def cmd_curator_run(args):
     if isinstance(lh.get("pruned"), dict) and lh["pruned"].get("archived"):
         print(f"  pruner: auto-archived {len(lh['pruned']['archived'])} never-used skill(s): "
               f"{', '.join(lh['pruned']['archived'])}")
+    if expired_proposals:
+        print(f"  proposals: expired {len(expired_proposals)} stale proposal(s): "
+              f"{', '.join(expired_proposals)}")
 
 
 # @spec SM-LC-010
