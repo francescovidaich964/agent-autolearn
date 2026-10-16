@@ -170,7 +170,7 @@ elif data['agent']['autolearn-reviewer'].get('prompt') != reviewer_prompt:
 if 'autolearn-curator' not in data['agent']:
     curator = json.loads(json.dumps(data['agent']['autolearn-reviewer']))
     curator['description'] = 'Maintains the autolearn memory store and skill library'
-    curator['steps'] = 40
+    curator['steps'] = 80
     curator['prompt'] = curator_prompt
     data['agent']['autolearn-curator'] = curator
     changed = True
