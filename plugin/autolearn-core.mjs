@@ -249,8 +249,8 @@ export function wrapperCommand(args, platform = process.platform) {
 // `opencode2`, the pi shell pins `pi`), falling back to
 // AUTOLEARN_OPENCODE_BIN (legacy name, still honored), then to detection.
 // pi runs reviews as one-shot print-mode processes with --no-session, so no
-// session cleanup is needed; opencode keeps the run/delete dance (v2 via the
-// HTTP API, which has no `session delete` CLI subcommand).
+// session cleanup is needed; opencode keeps the run/delete dance (both v1 and
+// v2 ship `session delete` - the v2 HTTP form broke on Windows, see run_review).
 const WRAPPER_CONTENT = `#!/bin/sh
 # Autolearn review runner - runs an opencode review, deletes the session,
 # then pushes the updated store via sync (if configured).
@@ -319,10 +319,7 @@ if [ "\$1" = "--curator" ]; then
     CSID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$COUT" | head -1)
     rm -f "\$COUT"
     if [ -n "\$CSID" ]; then
-      case "\$(basename "\$OC")" in
-        opencode2) "\$OC" api delete "/api/session/\$CSID" >/dev/null 2>&1 ;;
-        *)         "\$OC" session delete "\$CSID" >/dev/null 2>&1 ;;
-      esac
+      "\$OC" session delete "\$CSID" >/dev/null 2>&1
     fi
   fi
   # Same aftercare as the review path: push post-curator state when sync is
@@ -402,10 +399,9 @@ OUT=\$(mktemp "\${TMPDIR:-/tmp}/alreview.XXXXXX")
 SID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$OUT" | head -1)
 rm -f "\$OUT"
 if [ -n "\$SID" ]; then
-  case "\$(basename "\$OC")" in
-    opencode2) "\$OC" api delete "/api/session/\$SID" >/dev/null 2>&1 ;;
-    *)         "\$OC" session delete "\$SID" >/dev/null 2>&1 ;;
-  esac
+  # both v1 and v2 ship `session delete`; the old v2 HTTP form needed
+  # MSYS_NO_PATHCONV, which silently broke the Git Bash shim (cmd //c).
+  "\$OC" session delete "\$SID" >/dev/null 2>>"\$BASE.run.err"
 fi
 # Push after review completes so reviewer-written changes are included.
 # Stays silent when sync isn't configured (no API key or no salt).
