@@ -60,6 +60,15 @@ except ImportError:  # cryptography only needed for sync; module stays importabl
 # consoles (e.g. Windows cp1252). Sibling module in the same scripts dir.
 import stdio_guard
 
+# Cross-process store lock + atomic writes (RL-INT-001..003).
+import storelock
+# Write-time prompt-injection / secret scan (RL-INT-005).
+import safety
+# Two-tier memory: hard-capped core + relevance-retrieved archive (RL-MEM).
+import memlayers
+# Skill exact edits, proposals, rewrites, lint, audit (RL-SKL).
+import skillops
+
 # Memory Insight subsystem (registry + retention + composer + shift + ui).
 # These are siblings in the same scripts dir; imported here so the CLI can
 # dispatch to them. See docs/designs/memory-insight/LLD.md.
@@ -104,6 +113,10 @@ USAGE_FILE = SKILLS_DIR / ".usage.json"
 CURATOR_STATE_FILE = ACTIVE_PERSONA_DIR / ".curator_state.json"
 OBSERVATIONS_FILE = ACTIVE_PERSONA_DIR / "observations.jsonl"
 AGENTS_SKILLS_DIR = Path(os.environ.get("AGENTS_SKILLS_DIR", Path.home() / ".agents" / "skills"))
+
+# Stamped on observations so metrics can split before/after windows of a
+# design change (eval/store_report.py). Mirrors DESIGN_VERSION in the plugin.
+DESIGN_VERSION = "rl-2026.10"
 
 MAX_MEMORY_CHARS = 3000
 MAX_USER_CHARS = 2000
@@ -269,10 +282,27 @@ def load_usage() -> dict:
 
 def save_usage(data: dict):
     ensure_dirs()
-    USAGE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    storelock.atomic_write_text(USAGE_FILE, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def store_lock():
+    """Cross-process lock for the ACTIVE persona store (RL-INT-001)."""
+    return storelock.store_lock(ACTIVE_PERSONA_DIR)
+
+
+def _locked(fn):
+    """Run ``fn`` under the active persona's store lock (resolved at call time)."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with store_lock():
+            return fn(*a, **kw)
+    return wrapper
 
 
 # @spec CP-OUT-005, CP-INT-001, SM-LC-013, SM-LC-014, SM-LC-015, SM-LC-016
+@_locked
 def repair_skill_use_counts() -> dict:
     """Write skill load signals (derived from the outcome index) into .usage.json.
 
@@ -429,6 +459,7 @@ def cmd_proposals_scan(args):
 
 
 # @spec LH-PROP-003 — auto-promote verified proposals to skills (gated by falsify)
+@_locked
 def promote_proposals() -> dict:
     """Create skills for proposals whose common_resolution passed falsification.
 
@@ -504,6 +535,7 @@ def promote_proposals() -> dict:
 
 
 # @spec LH-PRUNE-001 — never-used pruner (use_count × age)
+@_locked
 def prune_unused_skills(config: dict) -> dict:
     """Auto-archive autolearn-created skills with use_count==0 past the grace period.
 
@@ -621,8 +653,8 @@ def load_curator_state() -> dict:
 
 def save_curator_state(state: dict):
     ensure_dirs()
-    CURATOR_STATE_FILE.write_text(
-        json.dumps(state, indent=2, ensure_ascii=False) + "\n"
+    storelock.atomic_write_text(
+        CURATOR_STATE_FILE, json.dumps(state, indent=2, ensure_ascii=False) + "\n"
     )
 
 
@@ -708,48 +740,275 @@ def memory_registry():
     return registry.MemoryRegistry(ACTIVE_PERSONA_DIR)
 
 
+def write_context(ctx: set | None = None) -> str:
+    """Migrate layers if needed, write memory.context.md (core) + the archive index."""
+    reg = memory_registry()
+    cfg = memlayers.load_config(ACTIVE_PERSONA_DIR)
+    memlayers.migrate(reg, cfg)
+    records = reg.load()
+    md = composer.compose(reg, ctx or set(), {
+        **composer.DEFAULT_CONFIG,
+        "core_caps": {"memory": cfg["core_memory_chars"], "user": cfg["core_user_chars"]},
+    })
+    storelock.atomic_write_text(ACTIVE_PERSONA_DIR / "memory.context.md", md)
+    memlayers.write_archive_index(ACTIVE_PERSONA_DIR, records, cfg)
+    return md
+
+
 def refresh_context():
-    """Regenerate memory.context.md after a registry mutation (retention-only ranking)."""
+    """Regenerate memory.context.md after a registry mutation."""
     try:
-        reg = memory_registry()
-        md = composer.compose(reg, set())
-        out = ACTIVE_PERSONA_DIR / "memory.context.md"
-        tmp = out.with_suffix(out.suffix + f".{os.getpid()}.tmp")
-        tmp.write_text(md, encoding="utf-8")
-        os.replace(tmp, out)
+        write_context()
     except Exception:
         pass  # context refresh must never break a memory write
 
 
-# @spec MI-REG-015, MI-CMP-009
-def cmd_memory_add(args):
+def log_observation(entry: dict) -> None:
+    """Append one event to observations.jsonl (locked append + trim)."""
+    entry.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+    entry.setdefault("design", DESIGN_VERSION)
+    review_id = os.environ.get("AUTOLEARN_REVIEW_ID")
+    if review_id:
+        entry.setdefault("review_id", review_id)
+    with store_lock():
+        storelock.append_line(OBSERVATIONS_FILE, json.dumps(entry, ensure_ascii=False))
+        trim_jsonl(OBSERVATIONS_FILE, 1000)
+
+
+# @spec RL-INT-005
+def guard_text(text: str, kind: str) -> None:
+    """Refuse content that looks like prompt injection or a secret.
+
+    Memory and skills are injected into every future session, so the store
+    must never persist instructions smuggled in through transcripts.
+    """
+    findings = safety.scan(text or "")
+    if not findings:
+        return
+    blocked = safety.blocking(findings)
+    log_observation({
+        "type": "write_blocked" if blocked else "write_warned",
+        "kind": kind,
+        "rules": sorted({f["rule"] for f in findings}),
+    })
+    for f in findings:
+        print(f"[safety:{f['verdict']}] {f['rule']}: {f['excerpt']}", file=sys.stderr)
+    if blocked:
+        print("Refused: the text looks like a prompt-injection payload or contains a "
+              "secret. Record the lesson in plain words without it.", file=sys.stderr)
+        sys.exit(3)
+
+
+def _refuse(exc: "memlayers.Refused", kind: str) -> None:
+    """Print a refused write with its resolution hints and exit 2."""
+    log_observation({"type": "write_refused", "kind": kind, "reason": exc.reason})
+    print(f"Refused: {exc}", file=sys.stderr)
+    for line in exc.details:
+        print(f"  {line}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _add_entry(args, type_: str) -> dict:
+    """Shared memory/user add: safety scan, duplicate + core-cap admission."""
     ensure_dirs()
+    text = (args.content or "").strip()
+    guard_text(text, type_)
     reg = memory_registry()
-    rec = reg.add(args.content, "memory")
+    cfg = memlayers.load_config(ACTIVE_PERSONA_DIR)
+    layer = "archive" if getattr(args, "archive", False) else "core"
+    try:
+        check = memlayers.make_check(getattr(args, "check_path", None),
+                                     getattr(args, "check_pattern", None),
+                                     getattr(args, "check_expect", None))
+    except memlayers.Refused as exc:
+        _refuse(exc, type_)
+    with reg.lock():
+        memlayers.migrate(reg, cfg)
+        records = reg.load()
+        exact = reg.find_by_text(text)
+        if exact is not None and exact.get("status") == "active":
+            print(f"Already recorded ({exact['id']}); use `memory strengthen --id {exact['id']}` to reinforce it.")
+            sys.exit(0)
+        try:
+            memlayers.admit(text, type_, layer, records, cfg,
+                            force_duplicate=bool(getattr(args, "force", False)))
+        except memlayers.Refused as exc:
+            # A full core must not drop the lesson: redirect to the archive unless
+            # the caller explicitly asked for core (--core-only or --pin).
+            if (exc.reason == "core_full" and layer == "core"
+                    and not getattr(args, "core_only", False)
+                    and not getattr(args, "pin", False)):
+                layer = "archive"
+                try:
+                    memlayers.admit(text, type_, layer, records, cfg,
+                                    force_duplicate=bool(getattr(args, "force", False)))
+                except memlayers.Refused as exc2:
+                    _refuse(exc2, type_)
+                log_observation({"type": "write_redirected", "kind": type_,
+                                 "reason": "core_full", "layer": "archive"})
+                print("Core full: stored in the archive instead (retrieved by relevance; "
+                      "use --core-only to refuse).", file=sys.stderr)
+            else:
+                _refuse(exc, type_)
+        fields = {"layer": layer}
+        if check:
+            fields["check"] = check
+        rec = reg.add(text, type_, pinned=bool(getattr(args, "pin", False)), **fields)
     refresh_context()
-    print(f"Memory updated: {rec['text'][:80]}")
+    return rec
+
+
+# @spec MI-REG-015, MI-CMP-009, RL-MEM-002
+def cmd_memory_add(args):
+    rec = _add_entry(args, "memory")
+    print(f"Memory updated [{rec.get('layer', 'core')}] {rec['id']}: {rec['text'][:80]}")
+
+
+def _resolve_one(reg, ident: str | None, keyword: str | None, type_: str | None = None) -> dict:
+    """Find exactly one active entry by id or by keyword substring."""
+    active = [r for r in reg.load_active() if type_ is None or r.get("type") == type_]
+    if ident:
+        rec = next((r for r in active if r.get("id") == ident), None)
+        if rec is None:
+            print(f"No active entry with id '{ident}'.", file=sys.stderr)
+            sys.exit(1)
+        return rec
+    kw = (keyword or "").lower()
+    matches = [r for r in active if kw and kw in r["text"].lower()]
+    if len(matches) != 1:
+        lead = "Multiple" if matches else "No"
+        hint = "; pass --id <id>:" if matches else "."
+        print(f"{lead} entries match '{keyword}'{hint}", file=sys.stderr)
+        for r in matches[:10]:
+            print(f"  {r['id']}: {r['text'][:100]}", file=sys.stderr)
+        sys.exit(1)
+    return matches[0]
+
+
+def cmd_memory_demote(args):
+    """Move a core entry to the archive (frees core space; still retrievable)."""
+    reg = memory_registry()
+    with reg.lock():
+        rec = _resolve_one(reg, args.id, None)
+        rec["layer"] = "archive"
+        reg.update(rec)
+    refresh_context()
+    print(f"Demoted to archive: {rec['id']}")
+
+
+def cmd_memory_promote(args):
+    """Move an archive entry into the always-injected core (cap-checked)."""
+    reg = memory_registry()
+    cfg = memlayers.load_config(ACTIVE_PERSONA_DIR)
+    with reg.lock():
+        rec = _resolve_one(reg, args.id, None)
+        try:
+            memlayers.admit(rec["text"], rec.get("type", "memory"), "core", reg.load(), cfg,
+                            force_duplicate=True, exclude_id=rec["id"])
+        except memlayers.Refused as exc:
+            _refuse(exc, rec.get("type", "memory"))
+        rec["layer"] = "core"
+        reg.update(rec)
+    refresh_context()
+    print(f"Promoted to core: {rec['id']}")
+
+
+def cmd_memory_edit(args):
+    """Rewrite one entry in place (merge, shorten, supersede). The id is stable."""
+    reg = memory_registry()
+    cfg = memlayers.load_config(ACTIVE_PERSONA_DIR)
+    text = args.content.strip()
+    guard_text(text, "memory")
+    with reg.lock():
+        rec = _resolve_one(reg, args.id, None)
+        try:
+            memlayers.admit(text, rec.get("type", "memory"), memlayers.layer_of(rec), reg.load(), cfg,
+                            force_duplicate=True, exclude_id=rec["id"])
+        except memlayers.Refused as exc:
+            _refuse(exc, rec.get("type", "memory"))
+        history = list(rec.get("edits") or [])[-2:]
+        history.append({"date": date.today().isoformat(), "old": rec["text"]})
+        rec["edits"] = history
+        rec["text"] = text
+        rec["topics"] = registry.extract_topics(text)
+        reg.update(rec)
+    refresh_context()
+    print(f"Edited {rec['id']} [{memlayers.layer_of(rec)}]: {text[:80]}")
+
+
+def cmd_memory_search(args):
+    reg = memory_registry()
+    layer = None if getattr(args, "all_layers", False) else "archive"
+    hits = memlayers.search(reg.load(), args.terms, limit=args.limit, layer=layer)
+    if not hits:
+        print("No matching entries.")
+        return
+    for score, r in hits:
+        print(f"  [{score:.2f}] {r['id']} [{memlayers.layer_of(r)}/{r.get('type')}]: {r['text']}")
+
+
+def cmd_memory_verify(args):
+    reg = memory_registry()
+    dry = bool(getattr(args, "dry_run", False))
+    res = memlayers.verify_checks(reg, dry_run=dry)
+    label = "would retire" if dry else "retired"
+    print(f"Checked {res['checked']} code-state memories; {label} {len(res['retired'])}; "
+          f"{len(res['unknown'])} not evaluable here.")
+    for r in res["retired"]:
+        print(f"  {r['id']}: {r['detail']} :: {r['text']}")
+    if res["retired"] and not dry:
+        log_observation({"type": "memories_retired", "count": len(res["retired"]),
+                         "ids": [r["id"] for r in res["retired"]]})
+        refresh_context()
 
 
 def cmd_memory_remove(args):
+    # A keyword used to delete EVERY match, so one vague reviewer call could
+    # wipe a swath of the store. Now: exactly one match (or --id), unless
+    # --all is explicit.
     reg = memory_registry()
-    keyword = args.keyword.lower()
-    matches = [r for r in reg.load_active() if keyword in r["text"].lower()]
-    for r in matches:
+    if getattr(args, "id", None) or not getattr(args, "all", False):
+        targets = [_resolve_one(reg, getattr(args, "id", None), args.keyword)]
+    else:
+        keyword = (args.keyword or "").lower()
+        targets = [r for r in reg.load_active() if keyword and keyword in r["text"].lower()]
+    for r in targets:
         reg.remove(r["id"])
     refresh_context()
-    print(f"Removed {len(matches)} entries ({len(reg.load_active())} remaining)")
+    print(f"Removed {len(targets)} entries ({len(reg.load_active())} remaining)")
+
+
+def _list_entries(args, type_: str | None) -> None:
+    reg = memory_registry()
+    cfg = memlayers.load_config(ACTIVE_PERSONA_DIR)
+    memlayers.migrate(reg, cfg)
+    records = reg.load_active()
+    if type_:
+        records = [r for r in records if r.get("type") == type_]
+    want = getattr(args, "layer", None)
+    shown = [r for r in records if not want or memlayers.layer_of(r) == want]
+    if not records:
+        print("User profile is empty." if type_ == "user" else "Memory is empty.")
+        return
+    for layer in ("core", "archive"):
+        rows = [r for r in shown if memlayers.layer_of(r) == layer]
+        if not rows:
+            continue
+        print(f"[{layer}]")
+        for r in rows:
+            flags = (" pinned" if r.get("pinned") else "") + (" check" if r.get("check") else "")
+            print(f"  {r['id']} ({r.get('type')}{flags}): {r['text']}")
+    allrec = reg.load()
+    for t in ("memory", "user"):
+        if type_ and t != type_:
+            continue
+        print(f"core {t}: {memlayers.core_used(allrec, t)}/{memlayers.cap_for(t, cfg)} chars")
+    n_arch = sum(1 for r in records if memlayers.layer_of(r) == "archive")
+    print(f"Total: {len(records)} active ({len(records) - n_arch} core, {n_arch} archive)")
 
 
 def cmd_memory_list(args):
-    reg = memory_registry()
-    records = reg.load_active()
-    if not records:
-        print("Memory is empty.")
-        return
-    for i, r in enumerate(records, 1):
-        print(f"  {i}. {r['text']}")
-    total = len(reg.load())
-    print(f"\nTotal: {len(records)} active entries (registry: {total} total incl. evicted)")
+    _list_entries(args, None)
 
 
 def cmd_memory_strengths(args):
@@ -769,17 +1028,10 @@ def cmd_memory_strengths(args):
 
 def cmd_memory_strengthen(args):
     reg = memory_registry()
-    keyword = args.keyword.lower()
-    matches = [r for r in reg.load_active() if keyword in r["text"].lower()]
-    if not matches:
-        print(f"No memory entries matching '{args.keyword}'.")
+    if not getattr(args, "id", None) and not getattr(args, "keyword", None):
+        print("Pass --id <id> or a keyword.", file=sys.stderr)
         sys.exit(1)
-    if len(matches) > 1:
-        print(f"Multiple entries match '{args.keyword}', please be more specific:")
-        for i, r in enumerate(matches, 1):
-            print(f"  {i}. {r['text'][:100]}")
-        sys.exit(1)
-    rec = matches[0]
+    rec = _resolve_one(reg, getattr(args, "id", None), getattr(args, "keyword", None))
     reg.reinforce(rec["id"])
     refresh_context()
     new = reg.get(rec["id"])
@@ -843,13 +1095,9 @@ def cmd_retention_evict(args):
 
 # @spec MI-CMP-001
 def cmd_memory_compose(args):
-    reg = memory_registry()
     ctx = composer.tokens(args.context) if getattr(args, "context", None) else set()
-    md = composer.compose(reg, ctx)
+    md = write_context(ctx)
     out = ACTIVE_PERSONA_DIR / "memory.context.md"
-    tmp = out.with_suffix(out.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(md, encoding="utf-8")
-    os.replace(tmp, out)
     n = max(0, md.count("\n- "))
     print(f"Wrote {out} ({n} entries, {len(md)} chars)")
 
@@ -878,17 +1126,17 @@ def cmd_topics_candidates(args):
 
 # @spec KS-MEM-004, KS-MEM-005, MI-REG-015  (user profile now lives in the registry, type="user")
 def cmd_user_add(args):
-    ensure_dirs()
-    reg = memory_registry()
-    reg.add(args.content, "user")
-    refresh_context()
-    print(f"User profile updated: {args.content[:80]}")
+    rec = _add_entry(args, "user")
+    print(f"User profile updated [{rec.get('layer', 'core')}] {rec['id']}: {rec['text'][:80]}")
 
 
 def cmd_user_remove(args):
     reg = memory_registry()
-    keyword = args.keyword.lower()
-    matches = [r for r in reg.load_active() if r.get("type") == "user" and keyword in r["text"].lower()]
+    if getattr(args, "id", None) or not getattr(args, "all", False):
+        matches = [_resolve_one(reg, getattr(args, "id", None), args.keyword, type_="user")]
+    else:
+        keyword = (args.keyword or "").lower()
+        matches = [r for r in reg.load_active() if r.get("type") == "user" and keyword and keyword in r["text"].lower()]
     for r in matches:
         reg.remove(r["id"])
     refresh_context()
@@ -896,13 +1144,7 @@ def cmd_user_remove(args):
 
 
 def cmd_user_list(args):
-    reg = memory_registry()
-    entries = [r for r in reg.load_active() if r.get("type") == "user"]
-    if not entries:
-        print("User profile is empty.")
-        return
-    for i, r in enumerate(entries, 1):
-        print(f"  {i}. {r['text']}")
+    _list_entries(args, "user")
 
 
 # @spec SM-SC-001, SM-SC-002, SM-SC-003, SM-SC-004, SM-SC-005
@@ -910,6 +1152,7 @@ def cmd_skill_create(args):
     ensure_dirs()
     name = slugify(args.name)
     desc = args.description
+    guard_text(desc, "skill")
     skill_dir = SKILLS_DIR / name
     skill_file = skill_dir / "SKILL.md"
 
@@ -919,13 +1162,17 @@ def cmd_skill_create(args):
 
     skill_dir.mkdir(parents=True, exist_ok=True)
 
+    verify = ""
+    if getattr(args, "verify_command", None):
+        guard_text(args.verify_command, "skill")
+        verify = "\n".join(skillops.verify_block(args.verify_command, args.verify_exit)) + "\n"
     content = f"""---
 name: {name}
 description: |
   {desc}
 created_by: autolearn
 created_at: "{date.today().isoformat()}"
----
+{verify}---
 
 # {name.replace("-", " ").title()}
 
@@ -971,11 +1218,310 @@ TODO: Add specific instructions based on observed patterns.
     print(f"Created skill: {name} at {skill_dir} (linked to {link_path})")
 
 
+def _role() -> str:
+    if os.environ.get("AUTOLEARN_REVIEWER") == "1":
+        return "reviewer"
+    if os.environ.get("AUTOLEARN_CURATOR") == "1":
+        return "curator"
+    return "session"
+
+
+def _deny_reviewer(action: str) -> None:
+    """RL-SKL-002: the reviewer works from a truncated transcript and patched
+    skills it never saw loaded; edits belong to the agent that used the skill.
+    The reviewer stages a proposal instead."""
+    if _role() != "reviewer":
+        return
+    log_observation({"type": "skill_edit_denied", "action": action})
+    print(f"Refused: reviewers cannot {action} skills directly.\n"
+          "  -> stage it: skill propose <name> --old \"<exact text>\" --new \"<replacement>\" --reason \"<evidence>\"\n"
+          "  -> the next session that loads the skill (or the curator/human) applies it.",
+          file=sys.stderr)
+    sys.exit(4)
+
+
+def _touch_usage(name: str, *, patched: bool = True, **fields) -> None:
+    with store_lock():
+        usage = load_usage()
+        meta = usage.get(name)
+        if meta is None:
+            return
+        if patched:
+            meta["patch_count"] = meta.get("patch_count", 0) + 1
+        meta["last_activity_at"] = date.today().isoformat()
+        meta.update({k: v for k, v in fields.items() if v is not None})
+        save_usage(usage)
+
+
+def _ledger(action: str, skill: str, summary: str, outcome: str = "accepted", trigger: str = "review") -> None:
+    if not wiki_layer.enabled(ACTIVE_PERSONA_DIR):
+        return
+    try:
+        wiki_layer.ensure_scaffold(ACTIVE_PERSONA_DIR)
+        wiki_layer.append_skill_impact(ACTIVE_PERSONA_DIR, action=action, skill=skill,
+                                       summary=summary[:300], outcome=outcome, trigger=trigger)
+    except Exception as exc:
+        print(f"(wiki ledger skipped: {exc})")
+
+
+def _skillop_fail(exc: "skillops.SkillOpError", code: int = 2) -> None:
+    print(f"Refused: {exc}", file=sys.stderr)
+    for line in exc.details:
+        print(f"  {line}", file=sys.stderr)
+    sys.exit(code)
+
+
+# @spec RL-SKL-001
+def cmd_skill_edit(args):
+    _deny_reviewer("edit")
+    name = slugify(args.name)
+    guard_text(args.new, "skill")
+    try:
+        res = skillops.apply_edit(SKILLS_DIR, name, args.old, args.new, args.file)
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc)
+    session = os.environ.get("AUTOLEARN_SESSION_ID")
+    _touch_usage(name, last_edit_session=session)
+    log_observation({"type": "skill_edited", "skill": name, "role": _role(), "session": session,
+                     "delta_chars": res["delta_chars"]})
+    _ledger("patch", name, f"[edit {args.file or 'SKILL.md'}] {args.new[:250]}",
+            trigger="review" if _role() == "session" else "curator")
+    print(f"Edited {name}/{args.file or 'SKILL.md'} ({res['delta_chars']:+d} chars); backup: {res['backup']}")
+
+
+# @spec RL-SKL-002
+def cmd_skill_propose(args):
+    name = slugify(args.name)
+    guard_text(f"{args.new}\n{args.reason}", "skill")
+    try:
+        path = skillops.resolve_file(SKILLS_DIR, name, args.file)
+        skillops.exact_replace(path.read_text(encoding="utf-8").replace("\r\n", "\n"),
+                               args.old.replace("\r\n", "\n"), args.new)
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc)
+    prop = skillops.add_proposal(SKILLS_DIR, kind="edit", skill=name, file=args.file or "SKILL.md",
+                                 old=args.old, new=args.new, reason=args.reason, source=_role(),
+                                 review_id=os.environ.get("AUTOLEARN_REVIEW_ID"))
+    log_observation({"type": "skill_proposed", "skill": name, "kind": "edit", "proposal": prop["id"], "role": _role()})
+    print(f"Staged edit proposal {prop['id']} for {name}. Apply with: skill apply {prop['id']}")
+
+
+# @spec RL-SKL-004
+def cmd_skill_rewrite(args):
+    name = slugify(args.name)
+    new_text = Path(args.from_file).read_text(encoding="utf-8")
+    guard_text(new_text, "skill")
+    try:
+        cur = skillops.resolve_file(SKILLS_DIR, name).read_text(encoding="utf-8")
+        skillops.validate_frontmatter(new_text)
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc)
+    refs = SKILLS_DIR / name / "references"
+    ref_texts = [p.read_text(encoding="utf-8", errors="replace") for p in refs.glob("*.md")] if refs.is_dir() else []
+    report = skillops.preservation_report(cur, [new_text] + ref_texts)
+    staged_dir = SKILLS_DIR / ".proposals"
+    staged_dir.mkdir(parents=True, exist_ok=True)
+    superseded = skillops.supersede_pending_rewrites(SKILLS_DIR, name)
+    prop = skillops.add_proposal(SKILLS_DIR, kind="rewrite", skill=name, file="SKILL.md",
+                                 reason=args.reason, source=_role(), old_chars=len(cur), new_chars=len(new_text),
+                                 missing=report["missing"][:50])
+    storelock.atomic_write_text(staged_dir / f"{prop['id']}.md", new_text)
+    log_observation({"type": "skill_proposed", "skill": name, "kind": "rewrite", "proposal": prop["id"],
+                     "role": _role(), "missing": len(report["missing"])})
+    print(f"Staged rewrite proposal {prop['id']} for {name}: {len(cur)} -> {len(new_text)} chars; "
+          f"{report['critical']} critical tokens, {len(report['missing'])} missing.")
+    if superseded:
+        print(f"Superseded pending rewrite(s): {', '.join(superseded)}")
+    for t in report["missing"][:20]:
+        print(f"  missing: {t}")
+    print(f"Apply with: skill apply {prop['id']}" + ("" if not report["missing"] else
+          "  (refused until the missing tokens are restored or moved to references/, "
+          "or a human passes --accept-loss)"))
+
+
+def cmd_skill_proposals(args):
+    items = skillops.load_proposals(SKILLS_DIR)
+    if not getattr(args, "all", False):
+        items = [p for p in items if p.get("status") == "pending"]
+    if not items:
+        print("No pending skill proposals.")
+        return
+    for p in items:
+        extra = f" missing={len(p.get('missing') or [])}" if p.get("kind") == "rewrite" else ""
+        print(f"  {p['id']} [{p.get('status')}] {p.get('kind')} {p.get('skill')}/{p.get('file')} "
+              f"by {p.get('source')}{extra}: {(p.get('reason') or '')[:100]}")
+
+
+# @spec RL-SKL-002, RL-SKL-004
+def cmd_skill_apply(args):
+    _deny_reviewer("apply proposals to")
+    try:
+        prop = skillops.get_proposal(SKILLS_DIR, args.id)
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc, 1)
+    if prop.get("status") != "pending":
+        print(f"Proposal {prop['id']} is already {prop.get('status')}.", file=sys.stderr)
+        sys.exit(1)
+    name = prop["skill"]
+    try:
+        if prop["kind"] == "edit":
+            res = skillops.apply_edit(SKILLS_DIR, name, prop["old"], prop["new"], prop.get("file"))
+        else:
+            if _role() == "curator" and not load_config().get("auto_apply_rewrites", False):
+                print("Refused: the curator may only stage rewrites (auto_apply_rewrites is off).", file=sys.stderr)
+                sys.exit(4)
+            new_text = (SKILLS_DIR / ".proposals" / f"{prop['id']}.md").read_text(encoding="utf-8")
+            path = skillops.resolve_file(SKILLS_DIR, name)
+            cur = path.read_text(encoding="utf-8")
+            refs = SKILLS_DIR / name / "references"
+            ref_texts = [p.read_text(encoding="utf-8", errors="replace") for p in refs.glob("*.md")] if refs.is_dir() else []
+            missing = skillops.preservation_report(cur, [new_text] + ref_texts)["missing"]
+            if missing and not (getattr(args, "accept_loss", None) and _role() == "session"):
+                raise skillops.SkillOpError(
+                    f"rewrite would drop {len(missing)} critical token(s)",
+                    details=[f"missing: {t}" for t in missing[:20]]
+                    + ["-> restore them (or move them to references/<topic>.md) and stage again",
+                       "-> a human may pass --accept-loss \"<why>\""])
+            bak = skillops.backup(SKILLS_DIR, name, path)
+            storelock.atomic_write_text(path, new_text)
+            res = {"backup": str(bak) if bak else None, "delta_chars": len(new_text) - len(cur)}
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc)
+    with store_lock():
+        skillops.set_proposal_status(SKILLS_DIR, prop["id"], "applied", applied_by=_role(),
+                                     accept_loss=getattr(args, "accept_loss", None))
+    _touch_usage(name, last_edit_session=os.environ.get("AUTOLEARN_SESSION_ID"))
+    log_observation({"type": "skill_proposal_applied", "skill": name, "kind": prop["kind"],
+                     "proposal": prop["id"], "role": _role(), "delta_chars": res["delta_chars"]})
+    _ledger("patch", name, f"[{prop['kind']} {prop['id']}] {(prop.get('reason') or '')[:240]}",
+            trigger="curator" if _role() == "curator" else "review")
+    if prop["kind"] == "rewrite":
+        with store_lock():
+            rejected = skillops.reject_conflicting_edits(SKILLS_DIR, name, prop["id"])
+        for pid in rejected:
+            log_observation({"type": "skill_proposal_rejected", "skill": name, "kind": "edit",
+                             "proposal": pid, "role": _role(),
+                             "reason": f"superseded by rewrite {prop['id']}"})
+        if rejected:
+            print(f"Auto-rejected {len(rejected)} conflicting edit proposal(s): {', '.join(rejected)}")
+    print(f"Applied {prop['kind']} proposal {prop['id']} to {name} ({res['delta_chars']:+d} chars); backup: {res['backup']}")
+
+
+def cmd_skill_reject(args):
+    with store_lock():
+        try:
+            prop = skillops.set_proposal_status(SKILLS_DIR, args.id, "rejected", reject_reason=args.reason,
+                                                rejected_by=_role())
+        except skillops.SkillOpError as exc:
+            _skillop_fail(exc, 1)
+    _ledger("patch", prop["skill"], f"[rejected {prop['id']}] {args.reason[:240]}", outcome="rejected",
+            trigger="curator" if _role() == "curator" else "review")
+    print(f"Rejected proposal {args.id}.")
+
+
+# @spec RL-SKL-003
+def cmd_skill_lint(args):
+    cfg = {**skillops.LINT_DEFAULTS, **{k: v for k, v in load_config().items() if k in skillops.LINT_DEFAULTS}}
+    names = [slugify(args.name)] if getattr(args, "name", None) else sorted(
+        p.parent.name for p in SKILLS_DIR.glob("*/SKILL.md"))
+    report = {n: skillops.lint_skill(SKILLS_DIR / n / "SKILL.md", cfg) for n in names
+              if (SKILLS_DIR / n / "SKILL.md").is_file()}
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2))
+        return
+    flagged = {n: f for n, f in report.items() if f}
+    for n, fs in flagged.items():
+        for f in fs:
+            print(f"  {n}: {f['rule']} {f['value']} -> {f['hint']}")
+    print(f"{len(flagged)} of {len(report)} skill(s) flagged.")
+
+
+# @spec RL-SKL-005
+def cmd_skill_pin(args):
+    name = slugify(args.name)
+    cap = int(load_config().get("max_pinned_skills", 5))
+    with store_lock():
+        usage = load_usage()
+        if name not in usage:
+            print(f"Skill not tracked: {name}", file=sys.stderr)
+            sys.exit(1)
+        pinned = [n for n, m in usage.items() if m.get("pinned") and n != name]
+        if len(pinned) >= cap:
+            print(f"Refused: {len(pinned)}/{cap} skills already pinned ({', '.join(sorted(pinned))}). "
+                  "Unpin one first; pins exempt skills from every lifecycle rule.", file=sys.stderr)
+            sys.exit(2)
+        usage[name]["pinned"] = True
+        usage[name]["pin_reason"] = args.reason
+        usage[name]["pinned_at"] = date.today().isoformat()
+        save_usage(usage)
+    log_observation({"type": "skill_pinned", "skill": name, "role": _role()})
+    print(f"Pinned {name}: {args.reason}")
+
+
+def cmd_skill_unpin(args):
+    name = slugify(args.name)
+    with store_lock():
+        usage = load_usage()
+        if name in usage:
+            usage[name]["pinned"] = False
+            usage[name].pop("pin_reason", None)
+            save_usage(usage)
+    print(f"Unpinned {name}")
+
+
+def _rewrite_frontmatter(name: str, key: str, block: list[str], label: str) -> None:
+    try:
+        path = skillops.resolve_file(SKILLS_DIR, name)
+        cur = path.read_text(encoding="utf-8")
+        new = skillops.set_frontmatter_block(cur, key, block)
+        skillops.validate_frontmatter(new)
+    except skillops.SkillOpError as exc:
+        _skillop_fail(exc)
+    bak = skillops.backup(SKILLS_DIR, name, path)
+    storelock.atomic_write_text(path, new)
+    _touch_usage(name)
+    log_observation({"type": "skill_frontmatter", "skill": name, "key": key, "role": _role()})
+    _ledger("patch", name, f"[{label}] " + " ".join(block)[:250],
+            trigger="curator" if _role() == "curator" else "review")
+    print(f"Updated {label} of {name}; backup: {bak}")
+
+
+# @spec RL-SKL-006
+def cmd_skill_set_description(args):
+    _deny_reviewer("change the description of")
+    guard_text(args.description, "skill")
+    _rewrite_frontmatter(slugify(args.name), "description", skillops.description_block(args.description), "description")
+
+
+# @spec RL-INP-004
+def cmd_skill_set_verify(args):
+    guard_text(args.verify_cmd, "skill")
+    _rewrite_frontmatter(slugify(args.name), "verify", skillops.verify_block(args.verify_cmd, args.expect_exit), "verify")
+
+
+# @spec RL-SKL-006
+def cmd_skill_audit(args):
+    rows = skillops.audit_never_loaded(SKILLS_DIR, load_usage(), SEARCH_DB, min_age_days=args.min_age_days)
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("No never-loaded skills past the grace period.")
+        return
+    if not SEARCH_DB.exists():
+        print("(search index missing: run `search init` first; every skill shows as dormant)")
+    for r in rows:
+        print(f"  {r['skill']} age={r['age_days']}d recurred_in={r['recurred_sessions']} session(s) "
+              f"-> {r['verdict']}  terms: {', '.join(r['terms'])}")
+
+
 # @spec SM-SP-001, SM-SP-002, SM-SP-003, SM-SP-004, SM-SP-005
 def cmd_skill_patch(args):
+    _deny_reviewer("patch")
     name = slugify(args.name)
     section = args.section
     content = args.content
+    guard_text(f"{section}\n{content}", "skill")
     skill_file = SKILLS_DIR / name / "SKILL.md"
 
     if not skill_file.exists():
@@ -1034,6 +1580,8 @@ def cmd_skill_patch(args):
             print(f"(wiki ledger/provenance skipped: {exc})")
 
     print(f"Patched skill: {name} (section: {section})")
+    print("note: patch only APPENDS a bullet; to correct stale text use "
+          "`skill edit <name> --old \"<exact>\" --new \"<text>\"` so the skill states the current truth once.")
 
 
 # @spec SM-SA-001, SM-SA-002, SM-SA-003, SM-SA-004, SM-SA-005
@@ -1086,7 +1634,13 @@ def cmd_skill_list(args):
         count = meta.get("use_count", 0)
         patches = meta.get("patch_count", 0)
         last = meta.get("last_activity_at", "unknown")
-        print(f"  {name} [{state}] uses={count} patches={patches} last={last}")
+        sk = SKILLS_DIR / name / "SKILL.md"
+        size = f" size={sk.stat().st_size}" if sk.is_file() else ""
+        pin = f" pinned ({meta.get('pin_reason', 'no reason')})" if meta.get("pinned") else ""
+        print(f"  {name} [{state}] uses={count} patches={patches} last={last}{size}{pin}")
+    pending = [p for p in skillops.load_proposals(SKILLS_DIR) if p.get("status") == "pending"]
+    if pending:
+        print(f"{len(pending)} pending skill proposal(s): run `skill proposals`")
 
 
 # @spec SM-SU-001, SM-SU-002
@@ -1098,21 +1652,9 @@ def cmd_skill_usage(args):
     print(json.dumps(usage, indent=2))
 
 
-# @spec SM-LC-001, SM-LC-002, SM-LC-003, SM-LC-004
-# @spec SM-LC-005, SM-LC-006, SM-LC-007, SM-LC-017
-# @spec SM-LC-008, SM-LC-009, SM-LC-011, SM-LC-012
-def cmd_curator_run(args):
-    config = load_config()
-    stale_days = config.get("stale_after_days", 30)
-    archive_days = config.get("archive_after_days", 90)
-    escalation_threshold = config.get("escalation_threshold", 3)
-    today = date.today()
-
-    usage = load_usage()
-    state = load_curator_state()
-
+def _lifecycle_transitions(usage: dict, stale_days: int, archive_days: int, today) -> dict:
+    """Inactivity-driven active -> stale -> archived transitions (mutates ``usage``)."""
     transitions = {"stale": [], "archived": [], "active": []}
-
     for name, meta in list(usage.items()):
         if meta.get("state") == "archived":
             continue
@@ -1143,8 +1685,45 @@ def cmd_curator_run(args):
         elif days_inactive >= stale_days and current_state == "active":
             meta["state"] = "stale"
             transitions["stale"].append(name)
+    return transitions
 
-    save_usage(usage)
+
+# @spec SM-LC-001, SM-LC-002, SM-LC-003, SM-LC-004
+# @spec SM-LC-005, SM-LC-006, SM-LC-007, SM-LC-017
+# @spec SM-LC-008, SM-LC-009, SM-LC-011, SM-LC-012
+def cmd_curator_run(args):
+    config = load_config()
+    stale_days = config.get("stale_after_days", 30)
+    archive_days = config.get("archive_after_days", 90)
+    escalation_threshold = config.get("escalation_threshold", 3)
+    today = date.today()
+
+    # RL-INT-003: crashed writers leave pid-suffixed tmp files behind.
+    try:
+        storelock.sweep_tmp(ACTIVE_PERSONA_DIR)
+    except Exception:
+        pass
+    # RL-MEM-007: retire code-state memories whose check no longer holds.
+    # Mechanical, so it does not depend on the curator agent remembering it.
+    try:
+        retired = memlayers.verify_checks(memory_registry())["retired"]
+        if retired:
+            log_observation({"type": "memories_retired", "count": len(retired), "ids": [r["id"] for r in retired]})
+            refresh_context()
+            print(f"  memory: retired {len(retired)} code-state memorie(s) whose check failed")
+    except Exception as exc:
+        print(f"  (memory verify skipped: {exc})")
+
+    with store_lock():
+        usage = load_usage()
+        transitions = _lifecycle_transitions(usage, stale_days, archive_days, today)
+        save_usage(usage)
+        try:
+            expired_proposals = skillops.expire_stale_proposals(
+                SKILLS_DIR, int(config.get("proposal_expiry_days", 30)))
+        except Exception:
+            expired_proposals = []
+    state = load_curator_state()
 
     escalation_candidates = []
     # Memory Insight: escalation is driven by registry reinforcement counts
@@ -1168,9 +1747,10 @@ def cmd_curator_run(args):
         cp["indexed"] = {"error": str(exc)}
     try:
         summary = falsify.verify_all(SKILLS_DIR, ACTIVE_PERSONA_DIR / falsify.VERDICTS_FILE)
-        usage = load_usage()
-        cons = falsify.apply_consequences(usage, summary["ledger"])
-        save_usage(usage)
+        with store_lock():
+            usage = load_usage()
+            cons = falsify.apply_consequences(usage, summary["ledger"])
+            save_usage(usage)
         cp["falsify"] = {k: summary[k] for k in ("pass", "fail", "inconclusive")}
         cp["falsify"]["demoted"] = len(cons["demoted"])
         # @spec WIKI-IMP-002 — demotions are harness-recorded verdicts
@@ -1215,15 +1795,18 @@ def cmd_curator_run(args):
     run_record = {
         "date": today.isoformat(),
         "transitions": transitions,
+        "proposals_expired": expired_proposals,
         "escalation_candidates": [
             {"entry": e, "strength": s} for e, s in escalation_candidates
         ],
         "certified_procedures": cp,
         "long_horizon": lh,
     }
-    state["last_run"] = today.isoformat()
-    state["runs"].append(run_record)
-    save_curator_state(state)
+    with store_lock():
+        state = load_curator_state()
+        state["last_run"] = today.isoformat()
+        state["runs"].append(run_record)
+        save_curator_state(state)
 
     total_transitions = sum(len(v) for v in transitions.values())
     cp_fail = cp.get("falsify", {})
@@ -1264,6 +1847,9 @@ def cmd_curator_run(args):
     if isinstance(lh.get("pruned"), dict) and lh["pruned"].get("archived"):
         print(f"  pruner: auto-archived {len(lh['pruned']['archived'])} never-used skill(s): "
               f"{', '.join(lh['pruned']['archived'])}")
+    if expired_proposals:
+        print(f"  proposals: expired {len(expired_proposals)} stale proposal(s): "
+              f"{', '.join(expired_proposals)}")
 
 
 # @spec SM-LC-010
@@ -1724,11 +2310,9 @@ def cmd_search_status(args):
 def trim_jsonl(path: Path, max_lines: int = 1000):
     """Trim a JSONL file to the last max_lines entries."""
     try:
-        content = path.read_text()
-        lines = content.strip().split("\n") if content.strip() else []
-        if len(lines) > max_lines:
-            path.write_text("\n".join(lines[-max_lines:]) + "\n")
-    except (OSError, IndexError):
+        with storelock.store_lock(path.parent):
+            storelock.trim_lines(path, max_lines)
+    except (OSError, IndexError, storelock.StoreLockTimeout):
         pass
 
 
@@ -1747,19 +2331,19 @@ def cmd_log_review_complete(args):
     if getattr(args, "nothing", False):
         entry["nothing_recorded"] = True
         entry["observations"] = 0
+        topics_raw = getattr(args, "topics", "") or ""
+        entry["topics"] = [t.strip() for t in topics_raw.split(",") if t.strip()]
     else:
         entry["observations"] = getattr(args, "observations", 0) or 0
         entry["memory_updated"] = getattr(args, "memory_updated", False) or False
         entry["user_profile_updated"] = getattr(args, "user_profile_updated", False) or False
         entry["skills_created"] = getattr(args, "skills_created", 0) or 0
         entry["skills_patched"] = getattr(args, "skills_patched", 0) or 0
+        entry["skills_proposed"] = getattr(args, "skills_proposed", 0) or 0
         topics_raw = getattr(args, "topics", "") or ""
         entry["topics"] = [t.strip() for t in topics_raw.split(",") if t.strip()]
 
-    with open(OBSERVATIONS_FILE, "a") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-    trim_jsonl(OBSERVATIONS_FILE, 1000)
+    log_observation(entry)
 
     if entry.get("nothing_recorded"):
         print("Logged: review_complete (nothing recorded)")
@@ -2307,6 +2891,9 @@ def cmd_sync_status(args):
     print(f"Machine ID: {sync_crypto.machine_id()}")
 
 
+LOCKED_COMMANDS = {"memory", "user", "skill", "log"}
+
+
 def main():
     stdio_guard.reconfigure_stdio()
     parser = argparse.ArgumentParser(
@@ -2324,14 +2911,45 @@ def main():
 
     mem = sub.add_parser("memory", help="Manage persistent memory", parents=[persona_parent])
     mem_sub = mem.add_subparsers(dest="subcommand")
-    mem_add = mem_sub.add_parser("add", help="Add a memory entry")
-    mem_add.add_argument("content", help="The lesson to remember")
-    mem_rm = mem_sub.add_parser("remove", help="Remove entries matching keyword")
-    mem_rm.add_argument("keyword", help="Keyword to match")
-    mem_sub.add_parser("list", help="List all memory entries")
+    def _entry_add_flags(p):
+        p.add_argument("content", help="The lesson to remember")
+        p.add_argument("--archive", action="store_true",
+                       help="Store in the archive (retrieved by relevance) instead of the always-injected core")
+        p.add_argument("--core-only", action="store_true",
+                       help="Refuse instead of redirecting to the archive when the core is full")
+        p.add_argument("--force", action="store_true", help="Add even if a near-duplicate exists")
+        p.add_argument("--pin", action="store_true", help="Pin (core, never evicted)")
+
+    mem_add = mem_sub.add_parser("add", help="Add a memory entry (core by default; archive when core is full; --core-only refuses)")
+    _entry_add_flags(mem_add)
+    mem_add.add_argument("--check-path", default=None,
+                         help="Code-state memory: file whose content decides whether the memory still holds")
+    mem_add.add_argument("--check-pattern", default=None, help="Regex looked up in --check-path")
+    mem_add.add_argument("--check-expect", default="present", choices=["present", "absent"],
+                         help="The memory holds while the pattern is present|absent (default present)")
+    mem_rm = mem_sub.add_parser("remove", help="Remove one entry (by --id or a unique keyword)")
+    mem_rm.add_argument("keyword", nargs="?", default=None, help="Keyword matching exactly one entry")
+    mem_rm.add_argument("--id", default=None, help="Exact entry id")
+    mem_rm.add_argument("--all", action="store_true", help="Remove every entry matching the keyword")
+    mem_list = mem_sub.add_parser("list", help="List memory entries by layer, with ids and core usage")
+    mem_list.add_argument("--layer", choices=["core", "archive"], default=None)
     mem_sub.add_parser("strengths", help="Show reinforcement statistics")
     mem_strength = mem_sub.add_parser("strengthen", help="Reinforce an existing memory (agent semantic dedup)")
-    mem_strength.add_argument("keyword", help="Keyword matching the entry to strengthen")
+    mem_strength.add_argument("keyword", nargs="?", default=None, help="Keyword matching the entry to strengthen")
+    mem_strength.add_argument("--id", default=None, help="Exact entry id (preferred)")
+    mem_demote = mem_sub.add_parser("demote", help="Move a core entry to the archive")
+    mem_demote.add_argument("id", help="Entry id")
+    mem_promote = mem_sub.add_parser("promote", help="Move an archive entry into the core (cap-checked)")
+    mem_promote.add_argument("id", help="Entry id")
+    mem_edit = mem_sub.add_parser("edit", help="Rewrite an entry in place (merge / shorten / supersede)")
+    mem_edit.add_argument("id", help="Entry id")
+    mem_edit.add_argument("content", help="New text")
+    mem_search = mem_sub.add_parser("search", help="Search the archive by relevance")
+    mem_search.add_argument("terms", help="Query text")
+    mem_search.add_argument("--limit", type=int, default=10)
+    mem_search.add_argument("--all-layers", action="store_true", help="Search core too")
+    mem_verify = mem_sub.add_parser("verify", help="Retire code-state memories whose check no longer holds")
+    mem_verify.add_argument("--dry-run", action="store_true")
     mem_weaken = mem_sub.add_parser("weaken", help="Reduce reinforcement on a memory")
     mem_weaken.add_argument("keyword", help="Keyword matching the entry to weaken")
     mem_compose = mem_sub.add_parser("compose", help="Generate memory.context.md from the registry")
@@ -2339,11 +2957,14 @@ def main():
 
     usr = sub.add_parser("user", help="Manage user profile", parents=[persona_parent])
     usr_sub = usr.add_subparsers(dest="subcommand")
-    usr_add = usr_sub.add_parser("add", help="Add a preference")
-    usr_add.add_argument("content", help="The preference to record")
-    usr_rm = usr_sub.add_parser("remove", help="Remove entries matching keyword")
-    usr_rm.add_argument("keyword", help="Keyword to match")
-    usr_sub.add_parser("list", help="List all user profile entries")
+    usr_add = usr_sub.add_parser("add", help="Add a preference (core by default; archive when core is full; --core-only refuses)")
+    _entry_add_flags(usr_add)
+    usr_rm = usr_sub.add_parser("remove", help="Remove one entry (by --id or a unique keyword)")
+    usr_rm.add_argument("keyword", nargs="?", default=None, help="Keyword matching exactly one entry")
+    usr_rm.add_argument("--id", default=None, help="Exact entry id")
+    usr_rm.add_argument("--all", action="store_true", help="Remove every entry matching the keyword")
+    usr_list = usr_sub.add_parser("list", help="List user profile entries by layer")
+    usr_list.add_argument("--layer", choices=["core", "archive"], default=None)
 
     sk = sub.add_parser("skill", help="Manage agent-created skills", parents=[persona_parent])
     sk_sub = sk.add_subparsers(dest="subcommand")
@@ -2351,10 +2972,56 @@ def main():
     sk_create.add_argument("name", help="Skill name")
     sk_create.add_argument("description", help="Skill description")
     sk_create.add_argument("--patterns", default="", help="Comma-separated wiki pattern slugs motivating this skill (recorded in PURPOSE.md)")
-    sk_patch = sk_sub.add_parser("patch", help="Patch an existing skill")
+    sk_create.add_argument("--verify-command", default=None,
+                           help="Cheap deterministic check proving the procedure works (falsify runs it)")
+    sk_create.add_argument("--verify-exit", type=int, default=0, help="Expected exit code (default 0)")
+    sk_patch = sk_sub.add_parser("patch", help="APPEND a bullet to a section (prefer `skill edit`)")
     sk_patch.add_argument("name", help="Skill name")
     sk_patch.add_argument("section", help="Section to patch")
     sk_patch.add_argument("content", help="Content to add")
+    sk_edit = sk_sub.add_parser("edit", help="Replace exactly one occurrence of --old with --new")
+    sk_edit.add_argument("name", help="Skill name")
+    sk_edit.add_argument("--old", required=True, help="Exact existing text (must occur once)")
+    sk_edit.add_argument("--new", required=True, help="Replacement text")
+    sk_edit.add_argument("--file", default=None, help="File inside the skill dir (default SKILL.md)")
+    sk_prop = sk_sub.add_parser("propose", help="Stage an exact edit for the agent with the evidence to apply")
+    sk_prop.add_argument("name", help="Skill name")
+    sk_prop.add_argument("--old", required=True, help="Exact existing text (must occur once)")
+    sk_prop.add_argument("--new", required=True, help="Replacement text")
+    sk_prop.add_argument("--reason", required=True, help="Evidence: what went wrong / what the user said")
+    sk_prop.add_argument("--file", default=None, help="File inside the skill dir (default SKILL.md)")
+    sk_rw = sk_sub.add_parser("rewrite", help="Stage a full SKILL.md rewrite (preservation-checked on apply)")
+    sk_rw.add_argument("name", help="Skill name")
+    sk_rw.add_argument("--from-file", required=True, help="File holding the complete new SKILL.md")
+    sk_rw.add_argument("--reason", required=True, help="Why (e.g. lint: incident-log-shape)")
+    sk_props = sk_sub.add_parser("proposals", help="List staged skill proposals")
+    sk_props.add_argument("--all", action="store_true", help="Include applied/rejected")
+    sk_apply = sk_sub.add_parser("apply", help="Apply a staged proposal")
+    sk_apply.add_argument("id", help="Proposal id")
+    sk_apply.add_argument("--accept-loss", default=None,
+                          help="(humans only) accept a rewrite that drops critical tokens, with a reason")
+    sk_rej = sk_sub.add_parser("reject", help="Reject a staged proposal (recorded in the ledger)")
+    sk_rej.add_argument("id", help="Proposal id")
+    sk_rej.add_argument("--reason", required=True)
+    sk_lint = sk_sub.add_parser("lint", help="Flag oversized / incident-log-shaped / sprawling skills")
+    sk_lint.add_argument("name", nargs="?", default=None)
+    sk_lint.add_argument("--json", action="store_true")
+    sk_pin = sk_sub.add_parser("pin", help="Exempt a skill from lifecycle rules (capped)")
+    sk_pin.add_argument("name")
+    sk_pin.add_argument("--reason", required=True, help="Why it must stay despite rare loads")
+    sk_unpin = sk_sub.add_parser("unpin", help="Remove a pin")
+    sk_unpin.add_argument("name")
+    sk_desc = sk_sub.add_parser("set-description", help="Replace the frontmatter description only")
+    sk_desc.add_argument("name")
+    sk_desc.add_argument("description")
+    sk_ver = sk_sub.add_parser("set-verify", help="Attach a verify: block (command + expected exit)")
+    sk_ver.add_argument("name")
+    # dest must not be "command": that is the top-level subcommand attribute.
+    sk_ver.add_argument("verify_cmd", metavar="command", help="Shell command proving the procedure works")
+    sk_ver.add_argument("--expect-exit", type=int, default=0)
+    sk_audit = sk_sub.add_parser("audit", help="Classify never-loaded skills: description failed vs dormant")
+    sk_audit.add_argument("--min-age-days", type=int, default=21)
+    sk_audit.add_argument("--json", action="store_true")
     sk_archive = sk_sub.add_parser("archive", help="Archive a skill")
     sk_archive.add_argument("name", help="Skill name")
     sk_sub.add_parser("list", help="List all agent-created skills")
@@ -2387,6 +3054,7 @@ def main():
     log_rc.add_argument("--user-profile-updated", action="store_true", help="User profile was updated")
     log_rc.add_argument("--skills-created", type=int, default=0, help="Skills created count")
     log_rc.add_argument("--skills-patched", type=int, default=0, help="Skills patched count")
+    log_rc.add_argument("--skills-proposed", type=int, default=0, help="Skill proposals staged")
     log_rc.add_argument("--topics", default="", help="Comma-separated topics in the conversation")
     log_rc.add_argument("--nothing", action="store_true", help="Nothing was recorded")
 
@@ -2507,6 +3175,11 @@ def main():
             "strengthen": cmd_memory_strengthen,
             "weaken": cmd_memory_weaken,
             "compose": cmd_memory_compose,
+            "demote": cmd_memory_demote,
+            "promote": cmd_memory_promote,
+            "edit": cmd_memory_edit,
+            "search": cmd_memory_search,
+            "verify": cmd_memory_verify,
         },
         "user": {
             "add": cmd_user_add,
@@ -2519,6 +3192,18 @@ def main():
             "archive": cmd_skill_archive,
             "list": cmd_skill_list,
             "usage": cmd_skill_usage,
+            "edit": cmd_skill_edit,
+            "propose": cmd_skill_propose,
+            "rewrite": cmd_skill_rewrite,
+            "proposals": cmd_skill_proposals,
+            "apply": cmd_skill_apply,
+            "reject": cmd_skill_reject,
+            "lint": cmd_skill_lint,
+            "pin": cmd_skill_pin,
+            "unpin": cmd_skill_unpin,
+            "set-description": cmd_skill_set_description,
+            "set-verify": cmd_skill_set_verify,
+            "audit": cmd_skill_audit,
         },
         "curator": {
             "run": cmd_curator_run,
@@ -2607,7 +3292,14 @@ def main():
         fn = cmd_map.get(subcmd)
         if fn:
             ensure_dirs()
-            fn(args)
+            # Short store-mutating commands run under the store lock as a
+            # whole so their load -> modify -> save sequences (usage ledger,
+            # registry, observations) are atomic across processes.
+            if args.command in LOCKED_COMMANDS:
+                with store_lock():
+                    fn(args)
+            else:
+                fn(args)
         else:
             print(f"Unknown subcommand: {args.command} {subcmd}")
             sys.exit(1)

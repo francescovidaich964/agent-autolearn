@@ -170,7 +170,15 @@ def _detect_project() -> str:
 def _agents_md_path(scope: str) -> Path:
     """Return the AGENTS.md file path for the given scope."""
     if scope == "global":
-        return Path(os.environ.get("AGENT_GLOBAL_AGENTS_MD", Path.home() / ".config" / "opencode" / "AGENTS.md"))
+        explicit = os.environ.get("AGENT_GLOBAL_AGENTS_MD")
+        if explicit:
+            return Path(explicit)
+        # The host's wrapper sets AUTOLEARN_OPENCODE_CONFIG (V2: ~/.config/opencode2);
+        # without it, fall back to the OpenCode 1 global config directory.
+        config = os.environ.get("AUTOLEARN_OPENCODE_CONFIG")
+        if config:
+            return Path(config).parent / "AGENTS.md"
+        return Path.home() / ".config" / "opencode" / "AGENTS.md"
     return Path(os.environ.get("AGENT_PROJECT_AGENTS_MD", "AGENTS.md"))
 
 

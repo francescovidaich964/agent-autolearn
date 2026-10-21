@@ -18,6 +18,8 @@ import sys
 from datetime import datetime, date
 from pathlib import Path
 
+import storelock
+
 DEFAULT_CONFIG = {
     "wiki_enabled": True,
     "wiki_page_max_lines": 100,
@@ -173,9 +175,7 @@ def write_pattern(persona_dir: Path, slug: str, title: str, body: str,
         body = f"# {title}\n\n" + body
     body += f"\nUpdated: {date.today().isoformat()}\n"
     _check_line_cap(body, _page_limit(persona_dir), slug)
-    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(body, encoding="utf-8")
-    os.replace(tmp, path)
+    storelock.atomic_write_text(path, body)
     return path
 
 
@@ -212,9 +212,7 @@ def update_pattern(persona_dir: Path, slug: str, *, add_resolution: str | None =
         content = _bump_updated(content)
 
     _check_line_cap(content, _page_limit(persona_dir), slug)
-    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
+    storelock.atomic_write_text(path, content)
     return path
 
 
@@ -234,9 +232,7 @@ def upsert_index_entry(persona_dir: Path, slug: str, one_liner: str) -> None:
     lines = [ln for ln in lines if slug not in ln or ln.startswith("- [")]
     if entry not in lines:
         lines.append(entry)
-    tmp = idx.with_suffix(idx.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.replace(tmp, idx)
+    storelock.atomic_write_text(idx, "\n".join(lines) + "\n")
 
 
 def remove_index_entry(persona_dir: Path, slug: str) -> None:
@@ -245,9 +241,7 @@ def remove_index_entry(persona_dir: Path, slug: str) -> None:
         return
     lines = [ln for ln in idx.read_text(encoding="utf-8").splitlines()
              if not ln.startswith(f"- [{slug}](patterns/")]
-    tmp = idx.with_suffix(idx.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.replace(tmp, idx)
+    storelock.atomic_write_text(idx, "\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -478,9 +472,7 @@ def cmd_wiki_read(args):
 def cmd_wiki_compose(args):
     md = compose_context(_persona_dir())
     out = wiki_dir(_persona_dir()) / "context.md"
-    tmp = out.with_suffix(out.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(md, encoding="utf-8")
-    os.replace(tmp, out)
+    storelock.atomic_write_text(out, md)
     print(f"Wrote {out} ({len(md)} chars)")
 
 

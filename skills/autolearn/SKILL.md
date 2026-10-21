@@ -7,15 +7,19 @@ description: >-
   corrected you, stated a preference or workflow spec, or expressed
   frustration about repetition, record it with `uv run
   ~/.agents/skills/autolearn/scripts/improve.py observe "<rule>" --project
-  <name>`. Do NOT load the full skill for observation; load
-  references/observer.md only for escalation thresholds or writing to
-  AGENTS.md. (2) REVIEWER (autonomous subagent, spawned every N user
-  messages): read references/reviewer.md — evaluate the conversation, check
-  the wiki and past sessions, record memories, update the user profile,
-  create or patch at most ONE skill. (3) CURATOR (scheduled job): read
-  references/curator.md — run the usage-evidence scan
-  (scripts/usage_analysis.py), consolidate narrow skills into umbrellas,
-  propose project-scoping and archives, maintain the library.
+  <name>`. When a skill you LOADED this session turns out wrong or incomplete
+  (or the user corrects its procedure), fix it right away with `uv run
+  ~/.agents/skills/autolearn/scripts/autolearn.py skill edit <name> --old
+  "<exact stale text>" --new "<current truth>"`; if the skill shows pending
+  autolearn proposals, apply or reject them. Do NOT load the full skill for
+  observation; load references/observer.md only for escalation thresholds
+  or writing to AGENTS.md. (2) REVIEWER (autonomous subagent, spawned every
+  N user messages): read references/reviewer.md — evaluate the
+  conversation, record each signal once (core or archive memory), propose
+  (never edit) skill fixes, at most ONE skill action. (3) CURATOR
+  (scheduled job): read references/curator.md — retire stale code-state
+  memories, fix descriptions of never-loaded skills, stage compaction
+  rewrites, consolidate narrow skills.
 license: MIT
 verify:
   command: "uv run --with pytest --with python-slugify pytest scripts/ --ignore=scripts/test_sync_e2e.py --ignore=scripts/test_sync_crypto.py"
@@ -138,15 +142,22 @@ broadly, replace the narrow entry with the general one.
 
 ## Hard Gates (all modes)
 
-- **One skill change per review**: at most ONE skill mutation (create OR
-  patch) per review cycle. Everything else waits for the next cycle.
+- **Skills are edited by the agent that used them**: in-session agents fix
+  skills they loaded (`skill edit`, exact replacement — never append a
+  "supersedes" bullet). The reviewer cannot edit skills; it stages at most
+  ONE skill action per review (`skill propose` for a loaded skill, or a
+  gated `skill create`).
 - **Recurrence gate for creation**: never `skill create` without verifying
   the pattern recurs across sessions (`proposals recurrence`); route
   single-session patterns to the wiki instead.
 - **Never delete skills** — archive only; archives are recoverable.
 - **Never touch user-installed skills** — only skills autolearn created.
 - **Never write secrets** to memory, profiles, or skills.
-- **Prefer strengthen over add** for semantic duplicates in the registry.
+- **Prefer strengthen/edit over add**: the CLI refuses near-duplicates and
+  writes that overflow the hard-capped core memory; resolve the refusal
+  (strengthen, edit, demote, or `--archive`) instead of forcing it.
+- **Code-state facts carry a check** (`--check-path/--check-pattern`) so
+  they retire themselves when the code changes.
 
 ## Data Layout
 
@@ -155,14 +166,15 @@ All state lives under `~/.autolearn/` (override with `AUTOLEARN_HOME`):
 ```text
 ~/.autolearn/
 ├── personas/default/
-│   ├── memory.context.md    # composed context view (injected every session)
-│   ├── memories.jsonl       # durable lesson registry (Ebbinghaus decay)
-│   ├── user-profile registry entries (type="user")
-│   ├── observations.jsonl   # append-only audit log
-│   ├── reviews/             # conversation slices handed to reviewers
+│   ├── memory.context.md    # CORE memory (hard-capped; injected every session)
+│   ├── memory.archive.json  # ARCHIVE index (per-session relevance slice, plugin)
+│   ├── memories.jsonl       # registry: memory + user entries, layer core|archive
+│   ├── observations.jsonl   # audit log (every event carries design + review_id)
+│   ├── review-runs.jsonl    # wrapper decisions: deferred/started/finished/...
+│   ├── reviews/             # review slices + <id>.run.jsonl/.run.err; pending/ queue
 │   ├── wiki/                # pattern notebook + skill-impact ledger
-│   ├── skills/              # agent-created skills
-│   └── config.yaml          # thresholds (review_threshold: 5, ...)
+│   ├── skills/              # agent-created skills; .history/ backups, .proposals.json
+│   └── config.yaml          # thresholds (review_threshold: 5, core caps, ...)
 └── sync.yaml                # optional cross-machine sync
 ```
 

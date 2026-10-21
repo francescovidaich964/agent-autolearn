@@ -23,6 +23,8 @@ import sqlite3
 from datetime import date
 from pathlib import Path
 
+import storelock
+
 import falsify
 import outcomes
 import shift
@@ -191,9 +193,7 @@ def _load(persona_dir: Path) -> dict:
 
 def _save(persona_dir: Path, proposals: dict) -> None:
     p = persona_dir / PROPOSALS_FILE
-    tmp = p.with_suffix(p.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(proposals, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, p)
+    storelock.atomic_write_text(p, json.dumps(proposals, indent=2, ensure_ascii=False) + "\n")
 
 
 def _proposal_id(sig: str) -> str:

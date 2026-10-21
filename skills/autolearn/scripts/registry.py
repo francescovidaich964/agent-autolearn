@@ -22,6 +22,8 @@ from pathlib import Path
 
 from slugify import slugify as python_slugify
 
+import storelock
+
 # @spec MI-REG-001
 REGISTRY_FILE = "memories.jsonl"
 LEGACY_MARKER = ".registry_migrated"  # idempotency marker for migrate_from_legacy
@@ -51,6 +53,11 @@ def slugify_text(text: str) -> str:
     slug = python_slugify(text.lower().strip())
     slug = slug[:ID_MAX_LEN].rstrip("-")
     return slug or "memory"
+
+
+def normalize_text(text: str) -> str:
+    """Case/whitespace-insensitive identity of a memory text."""
+    return " ".join((text or "").lower().split())
 
 
 def tokenize(text: str) -> list[str]:
@@ -187,85 +194,107 @@ class MemoryRegistry:
         return None
 
     def find_by_text(self, text: str) -> dict | None:
-        target = slugify_text(text)
+        # Compare the normalized FULL text: ids are 60-char slug prefixes, so
+        # two different lessons sharing a prefix used to collide here and the
+        # second one was silently dropped by add().
+        target = normalize_text(text)
         for r in self.load():
-            if r.get("id") == target:
+            if normalize_text(r.get("text", "")) == target:
                 return r
         return None
 
+    def unique_id(self, text: str, records: list[dict]) -> str:
+        base = slugify_text(text)
+        taken = {r.get("id") for r in records}
+        if base not in taken:
+            return base
+        suffix = hashlib.sha1(normalize_text(text).encode("utf-8")).hexdigest()[:6]
+        return f"{base[:ID_MAX_LEN - 7].rstrip('-')}-{suffix}"
+
     # -- mutation ----------------------------------------------------------
+    # Every mutation is a load -> modify -> save cycle; it runs under the
+    # cross-process store lock so concurrent reviewer / curator / compose
+    # processes cannot drop one another's updates (RL-INT-001).
+    def lock(self):
+        return storelock.store_lock(self.persona_dir)
+
     # @spec MI-REG-006
     def add(self, text: str, type: str = "memory", pinned: bool = False,
-            topics: list[str] | None = None) -> dict:
-        existing = self.find_by_text(text)
-        if existing is not None:
-            return existing
-        rec = new_record(text, type, pinned=pinned, topics=topics)
-        records = self.load()
-        records.append(rec)
-        self.save(records)
-        return rec
+            topics: list[str] | None = None, **fields) -> dict:
+        with self.lock():
+            existing = self.find_by_text(text)
+            if existing is not None:
+                return existing
+            rec = new_record(text, type, pinned=pinned, topics=topics)
+            rec.update(fields)
+            records = self.load()
+            rec["id"] = self.unique_id(text, records)
+            records.append(rec)
+            self.save(records)
+            return rec
 
     # @spec MI-REG-007
     def reinforce(self, id: str, when: str | None = None) -> dict | None:
-        records = self.load()
-        rec = next((r for r in records if r.get("id") == id), None)
-        if rec is None:
-            return None
-        when = when or today()
-        reinf = rec.setdefault("reinforcements", [])
-        if not reinf or reinf[-1] != when:
-            reinf.append(when)
-        rec["last_reinforced"] = reinf[-1]
-        if rec.get("status") == "evicted":  # a lesson came back
-            rec["status"] = "active"
-            rec["evicted_at"] = None
-        self.save(records)
-        return rec
+        with self.lock():
+            records = self.load()
+            rec = next((r for r in records if r.get("id") == id), None)
+            if rec is None:
+                return None
+            when = when or today()
+            reinf = rec.setdefault("reinforcements", [])
+            if not reinf or reinf[-1] != when:
+                reinf.append(when)
+            rec["last_reinforced"] = reinf[-1]
+            if rec.get("status") == "evicted":  # a lesson came back
+                rec["status"] = "active"
+                rec["evicted_at"] = None
+            self.save(records)
+            return rec
 
     # @spec MI-REG-008
     def update(self, record: dict) -> None:
-        records = self.load()
-        for i, r in enumerate(records):
-            if r.get("id") == record.get("id"):
-                records[i] = record
-                self.save(records)
-                return
-        # not found: treat as add
-        records.append(record)
-        self.save(records)
+        with self.lock():
+            records = self.load()
+            for i, r in enumerate(records):
+                if r.get("id") == record.get("id"):
+                    records[i] = record
+                    self.save(records)
+                    return
+            # not found: treat as add
+            records.append(record)
+            self.save(records)
 
     def remove(self, id: str) -> bool:
-        records = self.load()
-        new = [r for r in records if r.get("id") != id]
-        if len(new) == len(records):
-            return False
-        self.save(new)
-        return True
+        with self.lock():
+            records = self.load()
+            new = [r for r in records if r.get("id") != id]
+            if len(new) == len(records):
+                return False
+            self.save(new)
+            return True
 
     def set_pinned(self, id: str, value: bool) -> None:
-        rec = self.get(id)
-        if rec is not None:
-            rec["pinned"] = bool(value)
-            self.update(rec)
+        with self.lock():
+            rec = self.get(id)
+            if rec is not None:
+                rec["pinned"] = bool(value)
+                self.update(rec)
 
     def set_status(self, id: str, status: str, when: str | None = None) -> None:
-        rec = self.get(id)
-        if rec is not None:
-            rec["status"] = status
-            rec["evicted_at"] = when if status == "evicted" else None
-            self.update(rec)
+        with self.lock():
+            rec = self.get(id)
+            if rec is not None:
+                rec["status"] = status
+                rec["evicted_at"] = when if status == "evicted" else None
+                self.update(rec)
 
     # @spec MI-REG-009
     def save(self, records: list[dict]) -> None:
-        # pid-unique tmp: concurrent autolearn processes (plugin-spawned
-        # compose, scheduled jobs, installer) must not clobber each other's
-        # tmp files during the write->replace window.
-        tmp = self.path.with_suffix(self.path.suffix + f".{os.getpid()}.tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            for r in records:
-                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-        os.replace(tmp, self.path)
+        # pid-unique tmp + replace with Windows sharing-violation retry; the
+        # tmp never outlives a failed replace (RL-INT-002).
+        body = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
+        with self.lock():
+            storelock.atomic_write_text(self.path, body)
 
 
 # ---------------------------------------------------------------------------
@@ -358,11 +387,8 @@ def migrate_from_legacy(persona_dir: Path) -> int:
     # writes the .registry_migrated marker — so migrate_from_legacy short-
     # circuits on every subsequent call and the file is never created. An empty
     # JSONL file is the valid representation of an empty registry.
-    tmp = registry_path.with_suffix(registry_path.suffix + f".{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        for r in records:
-            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-    os.replace(tmp, registry_path)
+    storelock.atomic_write_text(
+        registry_path, "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records))
 
     # @spec MI-REG-014: preserve legacy memory.md, stop loading it
     if memory_md.exists():
@@ -380,7 +406,8 @@ def migrate_from_legacy(persona_dir: Path) -> int:
 def debug_log(persona_dir: Path, msg: str) -> None:
     """Best-effort debug log alongside the autolearn debug.log convention."""
     try:
-        with (Path.home() / ".autolearn" / "debug.log").open("a", encoding="utf-8") as fh:
+        home = Path(os.environ.get("AUTOLEARN_HOME", Path.home() / ".autolearn"))
+        with (home / "debug.log").open("a", encoding="utf-8") as fh:
             fh.write(f"[registry] {msg}\n")
     except OSError:
         pass

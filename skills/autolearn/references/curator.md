@@ -1,105 +1,137 @@
 # Curator Mode
 
-You are the autolearn curator. Your job is to review the skill library at
-`$HOME/.autolearn/skills/` and maintain its health. This mode runs as a
-scheduled job (weekly by default) or manually when the library feels
-cluttered.
-
-CLI: `$HOME/.agents/skills/autolearn/scripts/autolearn.py`
-
-## What You Do
-
-### Step 1: Run the automated curator
+You are the autolearn curator: periodic maintenance of the memory store and
+the skill library at `$HOME/.autolearn/personas/default/skills/`. The plugin
+triggers you every `curator_interval_days` (default 7); a human may also run
+you manually.
 
 ```bash
-uv run $HOME/.agents/skills/autolearn/scripts/autolearn.py curator run
+AL="$HOME/.agents/skills/autolearn/scripts/autolearn.py"
 ```
 
-Automatic state transitions:
+**Per-run budget** (keep the library stable; small steady improvements):
+at most ONE description fix, ONE compaction proposal and ONE consolidation.
+Skip any skill edited in the last 14 days (its owner is still iterating).
 
-- Skills with no activity for 30 days become `stale`
-- Skills with no activity for 90 days become `archived`
-- Pinned skills are exempt
-
-### Step 2: Run the usage-evidence scan
+## Step 1: Mechanical pass
 
 ```bash
-uv run $HOME/.agents/skills/autolearn/scripts/usage_analysis.py \
-  --json $HOME/.autolearn/usage-report.json
+uv run $AL curator run          # lifecycle transitions, outcome index, usage repair, tmp sweep
+uv run $AL memory verify        # retire code-state memories whose check no longer holds
 ```
 
-This mines ACTUAL skill loads from session history (pi sessions, opencode
-DB, legacy opencode storage) across the whole library: load counts,
-per-project distribution, same-session co-occurrence, and zero-load
-inventory skills. Interpretation:
+## Step 2: Evidence — which numbers to trust
 
-1. **Single-project skills** (>=80% of loads in one project, n>=2):
-   propose project-scoping; move the canonical copy into that project's
-   repo and load it only there (remove from the global install dir).
-2. **Co-occurring pairs** (>=3 shared sessions): candidates for one
-   umbrella skill with per-skill references (progressive disclosure).
-3. **Zero-load skills**: weak evidence only. Skills that prime from their
-   description alone (guardrails, checklists) never show loads. Never
-   archive on zero-load alone; flag for the human with the caveat.
-
-### Step 3: Review the skill library
+- `.usage.json` (shown by `skill list`; `use_count` is derived from the
+  outcome index of real `skill` tool loads) is **authoritative** for
+  lifecycle decisions (stale / archive / dormancy).
+- `usage_analysis.py` is **consolidation evidence only** (co-loading pairs,
+  per-project concentration). Do not archive or pin based on it.
 
 ```bash
-uv run $HOME/.agents/skills/autolearn/scripts/autolearn.py skill list
-uv run $HOME/.agents/skills/autolearn/scripts/autolearn.py skill usage
+uv run $AL skill list
+uv run $HOME/.agents/skills/autolearn/scripts/usage_analysis.py --json $HOME/.autolearn/usage-report.json
 ```
 
-Look for:
-
-1. **Prefix clusters**: multiple skills sharing a domain keyword
-   (e.g., "python-error-handling", "python-testing", "python-style")
-2. **Narrow skills**: very specific scope that could be sections of a
-   broader skill
-3. **Stale skills**: marked `stale` but could be revived
-4. **Duplicate content**: skills that overlap significantly
-
-### Step 4: Consolidate (if needed)
-
-For each cluster of narrow skills:
-
-1. Read each skill's SKILL.md
-2. Create an umbrella skill that covers the domain
-3. Move the best content from each narrow skill into the umbrella
-4. Archive the narrow skills:
+## Step 3: Never-loaded skills — one decision tree
 
 ```bash
-uv run $HOME/.agents/skills/autolearn/scripts/autolearn.py skill archive <narrow-skill-name>
+uv run $AL search init          # refresh the session index first
+uv run $AL skill audit
 ```
 
-### Step 5: Report
+Apply exactly this tree (it replaces any older "zero-load" guidance):
+
+1. **Pinned** → exempt. Nothing to do.
+2. **Never loaded, trigger recurred** (`fix-description`): the situation the
+   skill is for came up in later sessions, but the description did not make
+   the agent load it. Read 2–3 of the recurring user messages
+   (`search query "<terms>"`) and rewrite the description in the words users
+   actually used (what they ask for, not what the skill contains). One per
+   run:
+
+   ```bash
+   uv run $AL skill set-description <name> "<when to use it, in the user's words>"
+   ```
+
+3. **Never loaded, never recurred** (`dormant`) → keep. The mechanical grace
+   periods handle it (never-used pruner after 60 days, inactivity archive
+   after 90). Do not archive early.
+4. **Superseded** by another skill (its content now lives elsewhere) →
+   `skill archive <name>`.
+
+## Step 4: Compaction — lint, then stage a rewrite
+
+```bash
+uv run $AL skill lint
+```
+
+Pick at most ONE flagged skill (`oversized` / `incident-log-shape`) not
+edited in the last 14 days. Read it completely, then write the current truth:
+
+- Fold superseded bullets into one statement of what is true now; drop the
+  history (the backup in `skills/.history/` keeps it).
+- Move deep detail (long diagnoses, host inventories, exhaustive flag lists)
+  to `references/<topic>.md` inside the skill and link it from SKILL.md.
+  Create those files with a quoted heredoc so content is written verbatim:
+
+  ```bash
+  cat > "$HOME/.autolearn/personas/default/skills/<name>/references/<topic>.md" <<'EOF'
+  ...
+  EOF
+  ```
+
+- Keep every command, path, URL and inline-code token: the preservation
+  check refuses rewrites that drop one (unless it moved to references/).
+
+Write the new SKILL.md to a scratch file and stage it:
+
+```bash
+uv run $AL skill rewrite <name> --from-file /tmp/<name>.SKILL.md --reason "lint: incident-log-shape"
+```
+
+Staged rewrites are applied by a human (`skill apply <id>`), or by you only
+when `auto_apply_rewrites: true` is set in config.yaml. Report the proposal
+id and the preservation result.
+
+## Step 5: Pending proposals
+
+```bash
+uv run $AL skill proposals
+```
+
+Reviewer proposals are applied by the session that next loads the skill (it
+sees them when loading). Do not apply them yourself; list the ones older
+than 21 days in your report for the human, with their reason.
+
+## Step 6: Consolidation (at most one per run)
+
+```bash
+uv run $AL skill list
+```
+
+Look for prefix clusters or narrow skills that are sections of one domain,
+using the co-loading evidence from Step 2. For autolearn-created skills
+only: create the umbrella skill, move the best content into it (references
+per sub-skill), and archive the narrow ones with `skill archive <name>`.
+For user-installed skills, propose only.
+
+## Step 7: Report
 
 ```text
 Curator report:
-- Auto-transitions: N stale, M archived
-- Consolidated: X narrow skills into Y umbrellas
-- Skills library: A active, B stale, C archived
+- Memory: N code-state memories retired
+- Lifecycle: N stale, M archived
+- Audit: fix-description <skill> | dormant N | superseded N
+- Compaction: staged <proposal-id> for <skill> (old -> new chars, missing: K)
+- Pending proposals older than 21 days: <ids>
+- Consolidated: <narrow skills> -> <umbrella> | none
 ```
 
 ## Rules
 
-- Never delete skills. Only archive them. Archives are always recoverable.
-- Only AUTO-execute consolidation for skills created by autolearn
-  (`created_by: autolearn`). For user-installed skills, PROPOSE only: put
-  the concrete action list (umbrella merges, project-scoping moves,
-  archives) in the report and wait for explicit human approval.
-- Tool-managed skills (installed by their own tool's installer, refreshed
-  by that tool, e.g. `hey`) must never be modified, moved, or archived;
-  any proposal about them is informational only.
-- If unsure whether to consolidate, leave as-is.
-- Keep the umbrella skill's SKILL.md under 3000 characters.
-- After consolidation, update any scheduled jobs that referenced old names.
-
-## Scheduling
-
-Weekly cron example (OpenCode scheduler):
-
-```bash
-opencode schedule "autolearn-curator" --cron "0 3 * * 0"
---agent autolearn-reviewer
---prompt "Load the autolearn skill and follow references/curator.md to run the curator."
-```
+- Never delete skills. Archive only; archives and `.history/` backups are
+  recoverable.
+- Only modify skills created by autolearn (`created_by: autolearn`); for
+  user-installed skills, propose only. Tool-managed skills are never touched.
+- If unsure, leave as-is.

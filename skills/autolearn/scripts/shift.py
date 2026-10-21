@@ -17,6 +17,7 @@ from datetime import date
 from pathlib import Path
 
 import registry
+import storelock
 from registry import MemoryRegistry, topic_signature
 
 DEFAULT_CONFIG = {
@@ -146,11 +147,8 @@ def load_candidates(persona_dir: Path) -> list[dict]:
 
 def save_candidates(persona_dir: Path, candidates: list[dict]) -> None:
     path = candidates_path(persona_dir)
-    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        for c in candidates:
-            fh.write(json.dumps(c, ensure_ascii=False) + "\n")
-    os.replace(tmp, path)
+    storelock.atomic_write_text(
+        path, "".join(json.dumps(c, ensure_ascii=False) + "\n" for c in candidates))
 
 
 # @spec MI-SFT-004, MI-SFT-005, MI-SFT-006, MI-SFT-007, MI-SFT-008, MI-SFT-009

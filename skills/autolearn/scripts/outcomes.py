@@ -212,6 +212,10 @@ class OutcomeIndex:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [f"{ts}|{pid}"],
         )
+        # The final mark of a run used to stay uncommitted and was rolled
+        # back on close, so the high-water mark froze and every run
+        # re-indexed the whole tail (RL-OPS-006).
+        self.conn.commit()
 
     def _opencode_conn(self) -> sqlite3.Connection | None:
         if not self.opencode_db.exists():
