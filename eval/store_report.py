@@ -339,6 +339,7 @@ HEADLINE = [
     ("pipeline.events.skill_proposals_surfaced", "Proposals surfaced at skill load", None),
     ("pipeline.events.skill_proposal_applied", "Proposals applied", None),
     ("pipeline.events.write_refused", "Writes refused (duplicate / core full)", None),
+    ("pipeline.events.write_redirected", "Writes redirected to the archive (core full)", None),
     ("pipeline.events.write_blocked", "Writes blocked by the safety scan", None),
     ("pipeline.events.memories_retired", "Code-state retirement runs", None),
     ("integrity.orphan_tmp_files", "Orphaned tmp files", "down"),

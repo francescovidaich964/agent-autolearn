@@ -14,7 +14,7 @@ uv run $AL/improve.py <command>       # behavioral rules + AGENTS.md escalation
 | Command | Purpose |
 |---------|---------|
 | `init` | Initialize the autolearn store |
-| `memory add "<lesson>" [--archive] [--force] [--pin]` | Add a lesson. Core by default (hard-capped, injected every session); refused with exit 2 on near-duplicates or a full core |
+| `memory add "<lesson>" [--archive] [--force] [--pin] [--core-only]` | Add a lesson. Core by default (hard-capped, injected every session); a full core redirects to the archive with a notice, `--core-only` refuses with exit 2; near-duplicates refuse |
 | `memory add ... --check-path P --check-pattern R --check-expect present\|absent` | Code-state fact that retires itself when P stops matching |
 | `memory search "<terms>" [--all-layers]` | BM25 search (archive by default) — use instead of `memory list` |
 | `memory strengthen --id <id>` (or a unique keyword) | Reinforce an existing entry (same lesson seen again) |
@@ -25,7 +25,7 @@ uv run $AL/improve.py <command>       # behavioral rules + AGENTS.md escalation
 | `memory list [--layer core\|archive]` | List entries with ids, layers and core usage |
 | `memory weaken "<keyword>"` / `memory strengths` | Reinforcement tools |
 | `memory compose` | Regenerate `memory.context.md` (core) + `memory.archive.json` |
-| `user add "<preference>" [--archive] [--force]` | Add a user-profile preference (`type="user"`, own core cap) |
+| `user add "<preference>" [--archive] [--force] [--core-only]` | Add a user-profile preference (`type="user"`, own core cap; a full core redirects to the archive) |
 | `user list` / `user remove --id <id>` | List / remove profile entries |
 | `retention score` | Recompute Ebbinghaus retention scores & tiers |
 | `retention evict` | Evict memories past the cold grace period |

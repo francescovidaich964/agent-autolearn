@@ -833,7 +833,23 @@ def _add_entry(args, type_: str) -> dict:
             memlayers.admit(text, type_, layer, records, cfg,
                             force_duplicate=bool(getattr(args, "force", False)))
         except memlayers.Refused as exc:
-            _refuse(exc, type_)
+            # A full core must not drop the lesson: redirect to the archive unless
+            # the caller explicitly asked for core (--core-only or --pin).
+            if (exc.reason == "core_full" and layer == "core"
+                    and not getattr(args, "core_only", False)
+                    and not getattr(args, "pin", False)):
+                layer = "archive"
+                try:
+                    memlayers.admit(text, type_, layer, records, cfg,
+                                    force_duplicate=bool(getattr(args, "force", False)))
+                except memlayers.Refused as exc2:
+                    _refuse(exc2, type_)
+                log_observation({"type": "write_redirected", "kind": type_,
+                                 "reason": "core_full", "layer": "archive"})
+                print("Core full: stored in the archive instead (retrieved by relevance; "
+                      "use --core-only to refuse).", file=sys.stderr)
+            else:
+                _refuse(exc, type_)
         fields = {"layer": layer}
         if check:
             fields["check"] = check
@@ -2899,10 +2915,12 @@ def main():
         p.add_argument("content", help="The lesson to remember")
         p.add_argument("--archive", action="store_true",
                        help="Store in the archive (retrieved by relevance) instead of the always-injected core")
+        p.add_argument("--core-only", action="store_true",
+                       help="Refuse instead of redirecting to the archive when the core is full")
         p.add_argument("--force", action="store_true", help="Add even if a near-duplicate exists")
         p.add_argument("--pin", action="store_true", help="Pin (core, never evicted)")
 
-    mem_add = mem_sub.add_parser("add", help="Add a memory entry (core by default; refused when core is full)")
+    mem_add = mem_sub.add_parser("add", help="Add a memory entry (core by default; archive when core is full; --core-only refuses)")
     _entry_add_flags(mem_add)
     mem_add.add_argument("--check-path", default=None,
                          help="Code-state memory: file whose content decides whether the memory still holds")
@@ -2939,7 +2957,7 @@ def main():
 
     usr = sub.add_parser("user", help="Manage user profile", parents=[persona_parent])
     usr_sub = usr.add_subparsers(dest="subcommand")
-    usr_add = usr_sub.add_parser("add", help="Add a preference (core by default; refused when core is full)")
+    usr_add = usr_sub.add_parser("add", help="Add a preference (core by default; archive when core is full; --core-only refuses)")
     _entry_add_flags(usr_add)
     usr_rm = usr_sub.add_parser("remove", help="Remove one entry (by --id or a unique keyword)")
     usr_rm.add_argument("keyword", nargs="?", default=None, help="Keyword matching exactly one entry")

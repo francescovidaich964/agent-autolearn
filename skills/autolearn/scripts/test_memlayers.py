@@ -222,7 +222,7 @@ def _records(home):
 def test_cli_core_cap_demote_and_archive(home):
     assert _cli(home, "memory", "add", "Run pytest with -x for fast feedback in this repo").returncode == 0
     assert _cli(home, "memory", "add", "Use uv run with PEP 723 metadata for every script").returncode == 0
-    full = _cli(home, "memory", "add", "Docker builds must pin base images by digest always")
+    full = _cli(home, "memory", "add", "--core-only", "Docker builds must pin base images by digest always")
     assert full.returncode == 2 and "core memory is full" in full.stderr
     first = next(r for r in _records(home) if r["text"].startswith("Run pytest"))
     assert _cli(home, "memory", "demote", first["id"]).returncode == 0
@@ -234,6 +234,22 @@ def test_cli_core_cap_demote_and_archive(home):
     assert _cli(home, "memory", "add", "--archive", "Lab node labnode needs the ax key for scp hops").returncode == 0
     hits = _cli(home, "memory", "search", "labnode scp key")
     assert "lab-node-labnode" in hits.stdout
+
+
+def test_cli_core_full_redirects_to_archive(home):
+    assert _cli(home, "memory", "add", "Run pytest with -x for fast feedback in this repo").returncode == 0
+    assert _cli(home, "memory", "add", "Use uv run with PEP 723 metadata for every script").returncode == 0
+    redirected = _cli(home, "memory", "add", "Docker builds must pin base images by digest always")
+    assert redirected.returncode == 0
+    assert "stored in the archive" in redirected.stderr
+    docker = next(r for r in _records(home) if r["text"].startswith("Docker builds"))
+    assert docker["layer"] == "archive"
+    obs = (home / "personas" / "default" / "observations.jsonl").read_text(encoding="utf-8")
+    assert '"type": "write_redirected"' in obs
+    assert '"reason": "core_full"' in obs
+    # Explicit core requests still refuse: --pin means "must be in the core".
+    pinned = _cli(home, "memory", "add", "--pin", "Terraform state must live in the remote backend")
+    assert pinned.returncode == 2 and "core memory is full" in pinned.stderr
 
 
 def test_cli_duplicate_refused_then_strengthen_by_id(home):

@@ -91,9 +91,9 @@ The CLI may refuse a write (exit 2). Resolve it, do not fight it:
 
 - `near-duplicate` → strengthen or edit the listed entry (use `--force`
   only if it is genuinely a different lesson).
-- `core ... is full` → the listing shows the core. Demote the least broadly
-  useful entry (`memory demote <id>`), shorten one (`memory edit`), or add
-  with `--archive`.
+- `core ... is full` → the write is stored in the archive automatically (notice
+  on stderr). Use `--core-only` only when the rule must be in the always-injected
+  core; then demote or shorten an entry first.
 - `entry too long` → shorten to the actionable rule, or `--archive`.
 
 **Facts about code state** ("X is not implemented yet", "bug in Y") go stale
