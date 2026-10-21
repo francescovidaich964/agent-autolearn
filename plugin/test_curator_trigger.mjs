@@ -28,7 +28,7 @@ const HOME = mkdtempSync(join(tmpdir(), "al-curator-test-"))
 process.env.AUTOLEARN_HOME = HOME
 process.env.AUTOLEARN_DEBUG = "1"
 
-const { curatorDue, maybeSpawnCurator, ensureStore, runReviewSubprocess, wrapperCommand, winCommandLine, hiddenSpawnCommand, SPAWN_CMD_ENV, OBS_FILE, WRAPPER_SCRIPT, LAUNCHER_SCRIPT } = await import("./autolearn-core.mjs")
+const { curatorDue, maybeSpawnCurator, ensureStore, runReviewSubprocess, wrapperCommand, winCommandLine, hiddenSpawnCommand, injectInstructions, MEMORY_FILE, SPAWN_CMD_ENV, OBS_FILE, WRAPPER_SCRIPT, LAUNCHER_SCRIPT } = await import("./autolearn-core.mjs")
 
 // win32 cannot exec the POSIX wrapper directly (EFTYPE); route it through
 // Git Bash, mirroring the plugin's own spawn routing (ccfb8c6).
@@ -305,6 +305,29 @@ ok(wlArgv.length === 4 && wlArgv[0] === "C:/Windows/System32/wscript.exe" && wlA
 // would hang instead of seeing EOF).
 const launcherOnDisk = existsSync(LAUNCHER_SCRIPT) ? readFileSync(LAUNCHER_SCRIPT, "utf-8") : ""
 ok(process.platform !== "win32" || (launcherOnDisk.includes("cmd /c") && launcherOnDisk.includes("<nul") && launcherOnDisk.includes(SPAWN_CMD_ENV)), "installed launcher reads the command line and runs it hidden with NUL stdin (win32)")
+
+// ---------------------------------------------------------------------------
+console.log("H. instruction path dedupe")
+
+// Equivalent path forms (forward vs back slashes, Windows case) must collapse
+// to one entry, and the memory file must be recognized in any form.
+const cfgDir = mkdtempSync(join(tmpdir(), "al-cfg-"))
+const cfgPath = join(cfgDir, "opencode.json")
+const memForward = MEMORY_FILE.replaceAll("\\", "/")
+writeFileSync(cfgPath, JSON.stringify({
+  instructions: [
+    "C:/Users/test/.config/opencode/AGENTS.md",
+    memForward,
+    MEMORY_FILE,
+    process.platform === "win32" ? MEMORY_FILE.toUpperCase() : memForward,
+  ],
+}, null, 2))
+process.env.AUTOLEARN_OPENCODE_CONFIG = cfgPath
+injectInstructions()
+const cfgAfter = JSON.parse(readFileSync(cfgPath, "utf-8"))
+ok(cfgAfter.instructions.length === 2, "dedupes equivalent memory paths (keeps AGENTS.md + one memory entry)")
+ok(cfgAfter.instructions.filter((p) => p.toLowerCase().includes("memory.context.md")).length === 1, "exactly one memory.context.md entry")
+rmSync(cfgDir, { recursive: true, force: true })
 
 // ---------------------------------------------------------------------------
 

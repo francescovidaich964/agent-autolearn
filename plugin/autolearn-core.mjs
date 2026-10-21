@@ -681,6 +681,11 @@ export function truncate(text, maxLen) {
 }
 
 // @spec MI-CMP-009, MI-CMP-010
+function instructionKey(p) {
+  const s = String(p).replaceAll("\\", "/")
+  return process.platform === "win32" ? s.toLowerCase() : s
+}
+
 export function injectInstructions() {
   try {
     // AUTOLEARN_OPENCODE_CONFIG redirects the patched config (tests, sandboxes).
@@ -691,21 +696,33 @@ export function injectInstructions() {
     if (!data.instructions) data.instructions = []
 
     // Remove superseded memory instruction paths (flat-layout + persona memory.md).
-    // Memory Insight loads the generated memory.context.md instead. Matches
-    // both expanded absolute paths and literal-tilde forms.
+    // Memory Insight loads the generated memory.context.md instead. Compare by
+    // normalized key so slash style and Windows case do not defeat the match.
     const oldMemoryFile = join(AL_HOME, "memory.md")
-    const legacyForms = new Set([oldMemoryFile, LEGACY_MEMORY_FILE])
+    const legacyKeys = new Set([oldMemoryFile, LEGACY_MEMORY_FILE].map(instructionKey))
     try {
-      legacyForms.add(join(homedir(), ".autolearn", "memory.md").replace(homedir(), "~"))
-      legacyForms.add(LEGACY_MEMORY_FILE.replace(homedir(), "~"))
+      legacyKeys.add(instructionKey(join(homedir(), ".autolearn", "memory.md").replace(homedir(), "~")))
+      legacyKeys.add(instructionKey(LEGACY_MEMORY_FILE.replace(homedir(), "~")))
     } catch {}
-    const hadSuperseded = data.instructions.some(p => legacyForms.has(p))
+    const hadSuperseded = data.instructions.some(p => legacyKeys.has(instructionKey(p)))
     let changed = hadSuperseded
     if (hadSuperseded) {
-      data.instructions = data.instructions.filter(p => !legacyForms.has(p))
+      data.instructions = data.instructions.filter(p => !legacyKeys.has(instructionKey(p)))
     }
 
-    if (!data.instructions.includes(MEMORY_FILE)) {
+    // Collapse equivalent entries (forward vs back slashes, Windows case).
+    const beforeDedupe = data.instructions.length
+    const seen = new Set()
+    data.instructions = data.instructions.filter((p) => {
+      const key = instructionKey(p)
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    if (data.instructions.length !== beforeDedupe) changed = true
+
+    const memoryKey = instructionKey(MEMORY_FILE)
+    if (!data.instructions.some(p => instructionKey(p) === memoryKey)) {
       data.instructions.push(MEMORY_FILE)
       changed = true
     }
