@@ -302,7 +302,7 @@ if [ "\$1" = "--curator" ]; then
     rm -f "\$COUT"
     if [ -n "\$CSID" ]; then
       case "\$(basename "\$OC")" in
-        opencode2) "\$OC" api delete "/api/session/\$CSID" >/dev/null 2>&1 ;;
+        opencode2) "\$OC" session delete "\$CSID" >/dev/null 2>&1 ;;
         *)         "\$OC" session delete "\$CSID" >/dev/null 2>&1 ;;
       esac
     fi
@@ -385,7 +385,7 @@ SID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\
 rm -f "\$OUT"
 if [ -n "\$SID" ]; then
   case "\$(basename "\$OC")" in
-    opencode2) "\$OC" api delete "/api/session/\$SID" >/dev/null 2>&1 ;;
+    opencode2) "\$OC" session delete "\$SID" >/dev/null 2>&1 ;;
     *)         "\$OC" session delete "\$SID" >/dev/null 2>&1 ;;
   esac
 fi
