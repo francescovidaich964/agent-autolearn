@@ -316,6 +316,7 @@ if [ "\$1" = "--curator" ]; then
   printf '%s\\n' "\$NOW" > "\$CGATE/ts" 2>/dev/null
   trap 'rm -rf "\$CGATE" 2>/dev/null' EXIT
   OC="\${AUTOLEARN_HARNESS_BIN:-\${AUTOLEARN_OPENCODE_BIN:-}}"
+  if [ -n "\$OC" ] && ! command -v "\$OC" >/dev/null 2>&1; then OC=""; fi
   if [ -z "\$OC" ]; then
     if command -v pi >/dev/null 2>&1; then OC=pi
     elif command -v opencode2 >/dev/null 2>&1; then OC=opencode2
@@ -382,6 +383,7 @@ trap 'rm -rf "\$GATE" 2>/dev/null' EXIT
 # (fail-safe: a broken binary must not cause an endless retry loop).
 printf '%s:%s\\n' "\$NOW" "\$HASH" > "\$LOCK" 2>/dev/null
 OC="\${AUTOLEARN_HARNESS_BIN:-\${AUTOLEARN_OPENCODE_BIN:-}}"
+if [ -n "\$OC" ] && ! command -v "\$OC" >/dev/null 2>&1; then OC=""; fi
 if [ -z "\$OC" ]; then
   if command -v pi >/dev/null 2>&1; then OC=pi
   elif command -v opencode2 >/dev/null 2>&1; then OC=opencode2
