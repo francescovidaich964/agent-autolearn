@@ -102,6 +102,17 @@ export function redact(str) {
 }
 
 // @spec KS-MEM-001 (ensures directory tree exists before any operation)
+// Reviewer sessions run in a scratch directory, not the workspace: harness
+// UIs that list sessions per workspace cwd (e.g. Devin Desktop Spaces via
+// ACP session/list) would otherwise surface every review as a conversation.
+// Review content still targets the real project (absolute paths); only the
+// session's directory differs. Override with AUTOLEARN_REVIEW_CWD.
+export function reviewerCwd() {
+  const dir = process.env.AUTOLEARN_REVIEW_CWD || join(AL_HOME, "reviewer-cwd")
+  try { mkdirSync(dir, { recursive: true }) } catch {}
+  return dir
+}
+
 export function ensureStore() {
   migrateToPersonas()
   mkdirSync(DEFAULT_PERSONA_DIR, { recursive: true })
@@ -305,6 +316,7 @@ if [ "\$1" = "--curator" ]; then
   printf '%s\\n' "\$NOW" > "\$CGATE/ts" 2>/dev/null
   trap 'rm -rf "\$CGATE" 2>/dev/null' EXIT
   OC="\${AUTOLEARN_HARNESS_BIN:-\${AUTOLEARN_OPENCODE_BIN:-}}"
+  if [ -n "\$OC" ] && ! command -v "\$OC" >/dev/null 2>&1; then OC=""; fi
   if [ -z "\$OC" ]; then
     if command -v pi >/dev/null 2>&1; then OC=pi
     elif command -v opencode2 >/dev/null 2>&1; then OC=opencode2
@@ -371,6 +383,7 @@ trap 'rm -rf "\$GATE" 2>/dev/null' EXIT
 # (fail-safe: a broken binary must not cause an endless retry loop).
 printf '%s:%s\\n' "\$NOW" "\$HASH" > "\$LOCK" 2>/dev/null
 OC="\${AUTOLEARN_HARNESS_BIN:-\${AUTOLEARN_OPENCODE_BIN:-}}"
+if [ -n "\$OC" ] && ! command -v "\$OC" >/dev/null 2>&1; then OC=""; fi
 if [ -z "\$OC" ]; then
   if command -v pi >/dev/null 2>&1; then OC=pi
   elif command -v opencode2 >/dev/null 2>&1; then OC=opencode2
@@ -399,7 +412,7 @@ OUT=\$(mktemp "\${TMPDIR:-/tmp}/alreview.XXXXXX")
 SID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$OUT" | head -1)
 rm -f "\$OUT"
 if [ -n "\$SID" ]; then
-  # both v1 and v2 ship `session delete`; the old v2 HTTP form needed
+  # both v1 and v2 ship 'session delete'; the old v2 HTTP form needed
   # MSYS_NO_PATHCONV, which silently broke the Git Bash shim (cmd //c).
   "\$OC" session delete "\$SID" >/dev/null 2>>"\$BASE.run.err"
 fi
