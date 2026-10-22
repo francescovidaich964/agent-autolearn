@@ -50,13 +50,24 @@ export const AutolearnPlugin = async (ctx) => {
   let lastReviewUserMsg = 0
   let lastIdleReview = 0
   let buffer = []
+  // Skills loaded since the last review + tool notes in the current buffer
+  // (RL-INP-002): the review header lists the skills; notes are capped.
+  let loadedSkills = new Set()
+  let toolNotes = 0
   let currentSessionId = null
   let reviewInProgress = false
 
   const messageTexts = new Map()
   const messageRoles = new Map()
+  // Per-session state for the archive slice (RL-MEM-005); bounded so a
+  // weeks-long OpenCode process does not accumulate every session ever seen.
+  const firstMessages = new Map()
+  const sessionSlices = new Map()
+  const trimMap = (m, max = 200) => {
+    while (m.size > max) m.delete(m.keys().next().value)
+  }
 
-  const projectName = () => (directory || worktree || process.cwd()).split("/").pop() || "unknown"
+  const projectName = () => core.projectLabel(directory || worktree || process.cwd())
   const reviewCwd = () => core.reviewerCwd()
 
   core.injectInstructions()
@@ -81,8 +92,8 @@ export const AutolearnPlugin = async (ctx) => {
     // PEEK ONLY (commit: false): committing here would write the lock that
     // the authoritative gate in runReviewSubprocess then matches against,
     // suppressing every review (issue #14).
-    const reviewMd = core.formatReview(buffer, { project: projectName(), trigger })
-    if (!core.throttleCheck(reviewMd, false)) {
+    const reviewMd = core.formatReview(buffer, { project: projectName(), trigger, loadedSkills })
+    if (!core.throttleVerdict(reviewMd, { commit: false, checkBusy: true }).ok) {
       core.dbg("REVIEW QUEUED by throttle (v1)", buffer.length, "messages, trigger", trigger)
       return
     }
@@ -91,6 +102,8 @@ export const AutolearnPlugin = async (ctx) => {
     // @spec CM-BUF-003
     const captured = [...buffer]
     buffer = []
+    loadedSkills = new Set()
+    toolNotes = 0
 
     core.dbg("SPAWN REVIEW", captured.length, "messages, trigger", trigger)
 
@@ -126,16 +139,25 @@ export const AutolearnPlugin = async (ctx) => {
     if (reviewText.includes(core.REVIEW_HEADING)) return
 
     const captured = [...buffer]
+    const capturedSkills = loadedSkills
     buffer = []
+    loadedSkills = new Set()
+    toolNotes = 0
 
     try {
       core.runReviewSubprocess({
-        reviewMd: core.formatReview(captured, { project: projectName(), trigger: "exit" }),
+        reviewMd: core.formatReview(captured, { project: projectName(), trigger: "exit", loadedSkills: capturedSkills }),
         filePrefix: "review-exit",
         title: "autolearn exit review",
         cwd: reviewCwd(),
         env: { AUTOLEARN_OPENCODE_BIN: "opencode" },
-        log: false, // original exit path did not log an observation
+        // Logged like every other review so the metrics see exit reviews;
+        // a throttled exit review is queued: the buffer dies with the
+        // session, so dropping it would lose the conversation (RL-OPS-002).
+        trigger: "exit",
+        messageCount: captured.length,
+        project: projectName(),
+        queueIfThrottled: true,
       })
       core.dbg("EXIT REVIEW SPAWNED", captured.length, "messages")
     } catch (err) {
@@ -191,7 +213,8 @@ export const AutolearnPlugin = async (ctx) => {
             const text = messageTexts.get(msgId) || ""
             if (text && role === "assistant") {
               // @spec CM-TC-005, CM-TC-001
-              const content = core.redact(core.truncate(text, 2000))
+              // @spec RL-INP-001
+              const content = core.redact(core.truncate(text, config.max_assistant_chars || 2000))
               // @spec CM-TC-005, CM-TC-001 (assistant text buffered; kept
               // as an observability counter only — the threshold unit is
               // USER messages)
@@ -214,7 +237,8 @@ export const AutolearnPlugin = async (ctx) => {
               }
             } else if (text && role === "user") {
               // @spec CM-TC-004
-              const content = core.redact(core.truncate(text, 1000))
+              // @spec RL-INP-001 — corrections live in user messages; keep them whole.
+              const content = core.redact(core.truncate(text, config.max_user_chars || 4000))
               // @spec CM-BUF-001
               buffer.push({ role: "user", content, timestamp: new Date().toISOString() })
               // @spec CM-TC-007 (v1: the threshold unit is USER messages)
@@ -279,6 +303,75 @@ export const AutolearnPlugin = async (ctx) => {
       } catch (err) {
         core.dbg("EVENT ERROR", err.message)
         console.error("[autolearn] Event error:", err.message)
+      }
+    },
+
+    // @spec RL-SKL-007 — the agent's shell knows its session, so in-session
+    // `autolearn.py skill edit` calls are attributed to the session that
+    // loaded (and used) the skill.
+    "shell.env": async (input, output) => {
+      if (input?.sessionID && output?.env) output.env.AUTOLEARN_SESSION_ID = input.sessionID
+    },
+
+    // @spec RL-INP-002, RL-SKL-007 — skill loads, skill-file edits and failed
+    // tool calls become compact Tool notes in the review buffer.
+    "tool.execute.after": async (input, output) => {
+      try {
+        if (config.tool_notes === false) return
+        const note = core.toolNote(input, output)
+        if (!note) return
+        if (note.kind === "skill_load") {
+          loadedSkills.add(note.skill)
+          const pending = core.pendingProposalsNote(note.skill)
+          if (pending && typeof output?.output === "string") {
+            output.output += pending
+            core.logObs({ type: "skill_proposals_surfaced", skill: note.skill, session: input?.sessionID, project: projectName() })
+          }
+        }
+        if (note.kind === "skill_edit") {
+          core.logObs({ type: "skill_edited_in_session", skill: note.skill, session: input?.sessionID, tool: input?.tool, project: projectName() })
+        }
+        if (toolNotes >= (config.max_tool_notes || 20)) return
+        toolNotes++
+        buffer.push({ role: "tool", content: note.text, timestamp: new Date().toISOString() })
+      } catch (err) {
+        core.dbg("tool.execute.after hook failed", err.message)
+      }
+    },
+
+    // @spec RL-MEM-005 — remember each session's first user message: with the
+    // project it is the best relevance signal for the archive slice.
+    "chat.message": async (input, output) => {
+      try {
+        const sid = input?.sessionID
+        if (!sid || firstMessages.has(sid)) return
+        const text = (output?.parts || []).filter(p => p?.type === "text" && p.text).map(p => p.text).join("\n")
+        if (text) firstMessages.set(sid, text)
+        trimMap(firstMessages)
+      } catch (err) {
+        core.dbg("chat.message hook failed", err.message)
+      }
+    },
+
+    // @spec RL-MEM-005 — append the project-relevant archive slice, computed
+    // once per session and then frozen (byte-stable system prompt).
+    "experimental.chat.system.transform": async (input, output) => {
+      try {
+        if (config.session_archive_slice === false) return
+        const sid = input?.sessionID
+        if (!sid || !Array.isArray(output?.system)) return
+        if (!sessionSlices.has(sid)) {
+          const ctxText = core.sessionContextText({ directory: directory || worktree || process.cwd(), firstMessage: firstMessages.get(sid) })
+          const chosen = core.archiveSlice(ctxText)
+          sessionSlices.set(sid, core.formatArchiveSlice(chosen))
+          trimMap(sessionSlices)
+          core.dbg("ARCHIVE SLICE", sid, chosen.length, "entries")
+          if (chosen.length) core.logObs({ type: "archive_slice", session: sid, entries: chosen.length, ids: chosen.map(r => r.id), project: projectName() })
+        }
+        const slice = sessionSlices.get(sid)
+        if (slice) output.system.push(slice)
+      } catch (err) {
+        core.dbg("system.transform hook failed", err.message)
       }
     },
   }

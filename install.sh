@@ -132,8 +132,13 @@ if 'agent' not in data:
     data['agent'] = {}
 reviewer_prompt = (
     'Load the autolearn skill and follow references/reviewer.md to review '
-    'the attached conversation for learning opportunities. Take immediate '
-    'action: record observations, update memory, create or patch skills.'
+    'the attached conversation for learning opportunities. Record each '
+    'signal once, propose (never edit) skill fixes, and always finish with '
+    'log review-complete.'
+)
+curator_prompt = (
+    'Load the autolearn skill and follow references/curator.md to run the '
+    'curator.'
 )
 if 'autolearn-reviewer' not in data['agent']:
     data['agent']['autolearn-reviewer'] = {
@@ -157,6 +162,17 @@ if 'autolearn-reviewer' not in data['agent']:
     changed = True
 elif data['agent']['autolearn-reviewer'].get('prompt') != reviewer_prompt:
     data['agent']['autolearn-reviewer']['prompt'] = reviewer_prompt
+    changed = True
+
+# The curator does more per run than a review (audit, lint, staged rewrite,
+# consolidation): its own agent with a larger step budget. The plugin routes
+# curator runs to it when present (AUTOLEARN_CURATOR_AGENT).
+if 'autolearn-curator' not in data['agent']:
+    curator = json.loads(json.dumps(data['agent']['autolearn-reviewer']))
+    curator['description'] = 'Maintains the autolearn memory store and skill library'
+    curator['steps'] = 80
+    curator['prompt'] = curator_prompt
+    data['agent']['autolearn-curator'] = curator
     changed = True
 
 with open(path, 'w') as f:

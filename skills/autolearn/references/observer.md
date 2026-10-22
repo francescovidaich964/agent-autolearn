@@ -36,6 +36,23 @@ project", "just here".
 **Project detection**: if `--project` is omitted, the CLI auto-detects from
 `git remote get-url origin`.
 
+### Tier 1b: Fix the skills you use (in-session)
+
+You are the agent with the evidence about the skills you load. When a skill
+you loaded this session turns out wrong, outdated or incomplete — a command
+failed, a flag changed, the user corrected the procedure — fix it before
+moving on, by replacing the stale text (not by appending a correction):
+
+```bash
+uv run $HOME/.agents/skills/autolearn/scripts/autolearn.py skill edit <name> \
+  --old "<exact stale passage>" --new "<what is true now>"
+```
+
+When a loaded skill shows `<autolearn-proposals>`, those are fixes staged
+by the reviewer from earlier sessions: apply the ones your current
+experience confirms (`skill apply <id>`), reject wrong ones with the reason
+(`skill reject <id> --reason "..."`).
+
 ### Tier 2: Escalation & writing (this file, loaded on demand)
 
 Load when checking escalation thresholds, writing rules into AGENTS.md

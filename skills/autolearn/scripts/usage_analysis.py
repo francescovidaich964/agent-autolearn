@@ -98,13 +98,57 @@ def scan_pi_sessions() -> dict[str, dict]:
     return out
 
 
+def _tables(con) -> set[str]:
+    return {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _skills_in_tool(tool: str, inp: dict) -> set[str]:
+    if tool == "skill":
+        name = inp.get("name") or inp.get("id")
+        return {name} if name else set()
+    return set(SKILL_RE.findall(json.dumps(inp)))
+
+
+def scan_opencode_v1(con) -> dict[str, dict]:
+    """opencode v1 DB: `session` + `part` tables; tool parts carry the input.
+
+    The v2 scan below assumed a `session_v2` table and crashed the curator's
+    usage-evidence step on v1 installs (RL-OPS-006).
+    """
+    out: dict = {}
+    rows = con.execute(
+        "SELECT s.id, s.directory, s.time_created, p.data FROM part p "
+        "JOIN session s ON s.id = p.session_id "
+        # Cheap prefilter (compact or spaced JSON); json.loads below decides.
+        "WHERE p.data LIKE '%\"tool\"%'"
+    )
+    for sid, directory, ts, data in rows:
+        try:
+            obj = json.loads(data)
+        except Exception:
+            continue
+        if obj.get("type") != "tool":
+            continue
+        inp = (obj.get("state") or {}).get("input") or {}
+        skills = _skills_in_tool(obj.get("tool") or "", inp if isinstance(inp, dict) else {})
+        if not skills:
+            continue
+        rec = out.setdefault(("ocdb", sid), {
+            "proj": project_of(directory or ""), "date": date_of(ts), "skills": set()})
+        rec["skills"].update(skills)
+    return out
+
+
 def scan_opencode_db() -> dict[str, dict]:
-    """opencode v2 DB: dedicated `skill` tool + read-style tools given a path."""
+    """opencode DB: dedicated `skill` tool + read-style tools given a path."""
     out = {}
     if not os.path.exists(OC_DB):
         return out
     con = sqlite3.connect(f"file:{OC_DB}?mode=ro", uri=True)
     try:
+        tables = _tables(con)
+        if "session_v2" not in tables:
+            return scan_opencode_v1(con) if {"session", "part"} <= tables else out
         rows = con.execute("SELECT id, directory, time_created FROM session_v2").fetchall()
         for sid, directory, ts in rows:
             skills = set()

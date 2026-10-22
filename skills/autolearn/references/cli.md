@@ -14,15 +14,19 @@ uv run $AL/improve.py <command>       # behavioral rules + AGENTS.md escalation
 | Command | Purpose |
 |---------|---------|
 | `init` | Initialize the autolearn store |
-| `memory add "<lesson>"` | Add a durable lesson to the registry |
-| `memory list` | List entries (check for semantic duplicates first) |
-| `memory strengthen "<keyword>"` | Reinforce a semantically-duplicate entry |
-| `memory weaken "<keyword>"` | Reduce reinforcement on an entry |
-| `memory remove "<keyword>"` | Remove entries matching keyword |
-| `memory strengths` | Show reinforcement statistics |
-| `memory compose` | Regenerate `memory.context.md` from the registry |
-| `user add "<preference>"` | Add a user-profile preference (`type="user"`) |
-| `user list` / `user remove "<keyword>"` | List / remove profile entries |
+| `memory add "<lesson>" [--archive] [--force] [--pin] [--core-only]` | Add a lesson. Core by default (hard-capped, injected every session); a full core redirects to the archive with a notice, `--core-only` refuses with exit 2; near-duplicates refuse |
+| `memory add ... --check-path P --check-pattern R --check-expect present\|absent` | Code-state fact that retires itself when P stops matching |
+| `memory search "<terms>" [--all-layers]` | BM25 search (archive by default) — use instead of `memory list` |
+| `memory strengthen --id <id>` (or a unique keyword) | Reinforce an existing entry (same lesson seen again) |
+| `memory edit <id> "<text>"` | Rewrite an entry in place (merge / shorten / supersede) |
+| `memory demote <id>` / `memory promote <id>` | Move between core and archive (promote is cap-checked) |
+| `memory remove --id <id>` (or a unique keyword; `--all` for every match) | Remove an entry |
+| `memory verify [--dry-run]` | Retire code-state memories whose check no longer holds |
+| `memory list [--layer core\|archive]` | List entries with ids, layers and core usage |
+| `memory weaken "<keyword>"` / `memory strengths` | Reinforcement tools |
+| `memory compose` | Regenerate `memory.context.md` (core) + `memory.archive.json` |
+| `user add "<preference>" [--archive] [--force] [--core-only]` | Add a user-profile preference (`type="user"`, own core cap; a full core redirects to the archive) |
+| `user list` / `user remove --id <id>` | List / remove profile entries |
 | `retention score` | Recompute Ebbinghaus retention scores & tiers |
 | `retention evict` | Evict memories past the cold grace period |
 | `persona create/list/switch/archive/rename` | Manage knowledge personas |
@@ -31,10 +35,18 @@ uv run $AL/improve.py <command>       # behavioral rules + AGENTS.md escalation
 
 | Command | Purpose |
 |---------|---------|
-| `skill create <name> "<desc>" --patterns "<slugs>"` | Create a skill (recurrence gate REQUIRED — reviewer.md Step 7) |
-| `skill patch <name> "<section>" "<content>"` | Patch an existing skill (no gate) |
+| `skill create <name> "<desc>" --patterns "<slugs>" [--verify-command C --verify-exit N]` | Create a skill (recurrence gate REQUIRED — reviewer.md Step 5) |
+| `skill edit <name> --old "<exact>" --new "<text>" [--file F]` | Replace exactly one occurrence (in-session agents; refused for the reviewer) |
+| `skill propose <name> --old "<exact>" --new "<text>" --reason "<evidence>"` | Stage an edit; surfaced to the next session that loads the skill |
+| `skill rewrite <name> --from-file F --reason R` | Stage a full rewrite (preservation-checked) |
+| `skill proposals [--all]` / `skill apply <id>` / `skill reject <id> --reason R` | Review staged proposals |
+| `skill lint [name]` | oversized / incident-log-shape / references-sprawl |
+| `skill audit` | Never-loaded skills: `fix-description` (trigger recurred) vs `dormant` |
+| `skill set-description <name> "<desc>"` / `skill set-verify <name> "<cmd>" [--expect-exit N]` | Frontmatter-only edits |
+| `skill pin <name> --reason R` / `skill unpin <name>` | Exempt from lifecycle rules (capped by `max_pinned_skills`) |
+| `skill patch <name> "<section>" "<content>"` | Legacy: APPENDS a bullet (prefer `skill edit`; refused for the reviewer) |
 | `skill archive <name>` | Archive a skill (never delete) |
-| `skill list` / `skill usage` | List skills / show usage telemetry |
+| `skill list` / `skill usage` | List skills (size, pins, pending proposals) / show usage telemetry |
 | `curator run` / `curator status` | Auto stale/archive transitions / state |
 | `wiki compose` | Render `wiki/context.md` (reviewer pre-flight, MANDATORY) |
 | `wiki read "<terms>"` | Lexically search the pattern index |
@@ -48,8 +60,8 @@ uv run $AL/improve.py <command>       # behavioral rules + AGENTS.md escalation
 | Command | Purpose |
 |---------|---------|
 | `search init` / `search query "<terms>"` / `search sessions "<terms>"` / `search status` | FTS5 search over past sessions |
-| `log review-complete --observations N [--memory-updated] [--user-profile-updated] [--skills-created N] [--skills-patched N] --topics "<t1,t2>"` | Log review outcome |
-| `log review-complete --nothing` | Log an empty-handed review |
+| `log review-complete --observations N [--memory-updated] [--user-profile-updated] [--skills-created N] [--skills-proposed N] --topics "<t1,t2>"` | Log review outcome (joins the run via `AUTOLEARN_REVIEW_ID`) |
+| `log review-complete --nothing --topics "<t1,t2>"` | Log an empty-handed review |
 | `proposals recurrence "<terms>"` | Recurrence gate for skill creation |
 | `proposals scan` | Long-horizon scan → verify → promote (scheduled tick) |
 | `topics scan` / `topics candidates` | Recurring-preference (shift) detector |

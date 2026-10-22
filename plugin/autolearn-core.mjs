@@ -30,6 +30,7 @@ import {
   readFileSync,
   readdirSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -71,6 +72,8 @@ export const SALT_FILE = join(AL_HOME, ".encryption_salt")
 // autolearn-reviewer). Resolve the new path, fall back to the legacy one for
 // installs that predate the consolidation.
 function resolveCli() {
+  // AUTOLEARN_CLI pins the CLI (tests, A/B replays of a working tree).
+  if (process.env.AUTOLEARN_CLI) return process.env.AUTOLEARN_CLI
   const fresh = join(homedir(), ".agents", "skills", "autolearn", "scripts", "autolearn.py")
   try { if (existsSync(fresh)) return fresh } catch {}
   return join(homedir(), ".agents", "skills", "autolearn-reviewer", "scripts", "autolearn.py")
@@ -82,6 +85,9 @@ export const IDLE_COOLDOWN_MS = 300000
 export const MIN_INTERVAL_DEFAULT_MS = 180000 // 3 min between review starts, global (serializes bursts; dedupe handles same-content)
 export const MAX_REVIEWS_PER_DAY_DEFAULT = 60 // hard ceiling across all projects (~2.5/hr sustained)
 export const REVIEW_HEADING = "# Autolearn Review"
+// Stamped on observations and review files so metrics can split the
+// before/after windows of a design change (eval/store_report.py).
+export const DESIGN_VERSION = "rl-2026.10"
 export const DEBUG = process.env.AUTOLEARN_DEBUG === "1"
 export const DBG_FILE = join(AL_HOME, "debug.log")
 
@@ -99,6 +105,82 @@ export const SECRET_RE =
 export function redact(str) {
   if (!str) return str
   return str.replace(SECRET_RE, "$1$2$3[REDACTED]")
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process store lock (RL-INT-001). Same protocol as storelock.py: an
+// atomic mkdir of <persona>/.store.lock/, broken when older than 120 s. The
+// plugin runs inside the harness process, so it never waits long: after
+// `timeoutMs` it logs and proceeds unlocked rather than stall the host.
+export const STORE_LOCK_DIR = join(DEFAULT_PERSONA_DIR, ".store.lock")
+export const STORE_LOCK_STALE_MS = 120000
+
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms) } catch {}
+}
+
+export function withStoreLock(fn, { timeoutMs = 2000, lockDir = STORE_LOCK_DIR } = {}) {
+  const deadline = Date.now() + timeoutMs
+  let delay = 5
+  let held = false
+  for (;;) {
+    try {
+      mkdirSync(lockDir)
+      held = true
+      break
+    } catch (err) {
+      if (err.code !== "EEXIST" && err.code !== "EPERM") {
+        if (err.code === "ENOENT") { try { mkdirSync(join(lockDir, ".."), { recursive: true }) } catch {} ; continue }
+        break
+      }
+      try {
+        if (Date.now() - statSync(lockDir).mtimeMs > STORE_LOCK_STALE_MS) {
+          const grave = `${lockDir}.stale.${process.pid}.${Date.now()}`
+          try { renameSync(lockDir, grave); rmSync(grave, { recursive: true, force: true }) } catch {}
+          continue
+        }
+      } catch {}
+      if (Date.now() >= deadline) { dbg("store lock busy, proceeding unlocked"); break }
+      sleepSync(delay)
+      delay = Math.min(delay * 2, 100)
+    }
+  }
+  if (held) {
+    try { writeFileSync(join(lockDir, "owner"), `${process.pid} ${Math.floor(Date.now() / 1000)} js\n`) } catch {}
+  }
+  try {
+    return fn()
+  } finally {
+    if (held) { try { rmSync(lockDir, { recursive: true, force: true }) } catch {} }
+  }
+}
+
+// RL-INT-003: writers killed between write and rename leave pid-suffixed
+// *.tmp files; sweep the ones older than an hour on every plugin load.
+export function sweepTmp(dirs = [DEFAULT_PERSONA_DIR, SKILLS_DIR], maxAgeMs = 3600000) {
+  const removed = []
+  const now = Date.now()
+  for (const dir of dirs) {
+    let names = []
+    try { names = readdirSync(dir) } catch { continue }
+    for (const f of names) {
+      if (!f.endsWith(".tmp")) continue
+      const p = join(dir, f)
+      try {
+        if (now - statSync(p).mtimeMs > maxAgeMs) { unlinkSync(p); removed.push(f) }
+      } catch {}
+    }
+  }
+  if (removed.length) dbg("SWEPT orphaned tmp files", removed)
+  return removed
+}
+
+// RL-INT-004: project label from a working directory on any platform. The
+// shells used `.split("/")`, which returns the whole path on Windows and
+// broke every per-project scope.
+export function projectLabel(dir) {
+  const parts = String(dir || "").replace(/[\\/]+$/, "").split(/[\\/]/)
+  return parts.pop() || "unknown"
 }
 
 // @spec KS-MEM-001 (ensures directory tree exists before any operation)
@@ -131,6 +213,7 @@ export function ensureStore() {
   }
   ensureWrapper()
   ensureLauncher()
+  sweepTmp()
 }
 
 // Phase 3 migration: move flat ~/.autolearn/ files to personas/default/
@@ -327,7 +410,7 @@ if [ "\$1" = "--curator" ]; then
     printf '%s' "\$CPROMPT" | "\$OC" -p --no-session -na >/dev/null 2>&1
   else
     COUT=\$(mktemp "\${TMPDIR:-/tmp}/alcurator.XXXXXX")
-    "\$OC" run --format json --agent autolearn-reviewer "\$CPROMPT" > "\$COUT" 2>/dev/null
+    "\$OC" run --format json --agent "\${AUTOLEARN_CURATOR_AGENT:-autolearn-reviewer}" "\$CPROMPT" > "\$COUT" 2>/dev/null
     CSID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$COUT" | head -1)
     rm -f "\$COUT"
     if [ -n "\$CSID" ]; then
@@ -349,6 +432,31 @@ fi
 # ~32 KB with ENAMETOOLONG (issue #21).
 REVIEW_FILE="\$1"
 shift
+PDIR="\$AL/personas/default"
+REVIEWS="\$PDIR/reviews"
+PENDING="\$REVIEWS/pending"
+RUNLOG="\$PDIR/review-runs.jsonl"
+DRAIN_MAX=3
+PENDING_MAX_AGE_S=259200
+# One JSON line per wrapper decision (RL-OPS-001). Every value is a plain
+# token (review basename, integer, bareword), so no JSON escaping is needed;
+# extra fields are passed pre-formatted in \$3 using sh quote concatenation
+# (no backslashes: this script lives inside a JS template literal).
+runlog() {
+  printf '{"ts":%s,"event":"%s","review":"%s","design":"${DESIGN_VERSION}"%s}\\n' "\$(date +%s)" "\$1" "\$(basename "\$2" .md)" "\$3" >> "\$RUNLOG" 2>/dev/null
+}
+# A review the gates cannot run NOW is queued, never dropped (RL-OPS-002):
+# the plugin cleared its buffer when it handed us this file, so exiting here
+# would lose the conversation. The current gate holder drains the queue.
+defer() {
+  mkdir -p "\$PENDING" 2>/dev/null
+  if mv "\$REVIEW_FILE" "\$PENDING/" 2>/dev/null; then
+    runlog deferred "\$REVIEW_FILE" ',"reason":"'"\$1"'"'
+  else
+    runlog lost "\$REVIEW_FILE" ',"reason":"'"\$1"'"'
+  fi
+  exit 0
+}
 # Gate 3 first (cheap, no state change): identical conversation → skip.
 CONV=\$(sed -n '/## Conversation/,\$p' "\$REVIEW_FILE" 2>/dev/null)
 HASH=""
@@ -356,25 +464,27 @@ if [ -n "\$CONV" ]; then
   HASH=\$(printf '%s' "\$CONV" | md5 -q 2>/dev/null || printf '%s' "\$CONV" | md5sum | cut -d' ' -f1)
   OLDHASH=\$(cut -d: -f2 "\$LOCK" 2>/dev/null)
   if [ -n "\$HASH" ] && [ -n "\$OLDHASH" ] && [ "\$HASH" = "\$OLDHASH" ]; then
+    runlog skipped_duplicate "\$REVIEW_FILE" ""
     exit 0
   fi
 fi
-# Gate 2: start-to-start spacing (seconds).
+# Gate 2: start-to-start spacing (seconds). Too soon → queue, not drop.
 LAST=\$(cut -d: -f1 "\$LOCK" 2>/dev/null)
 case "\$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
 if [ \$(( NOW - LAST )) -lt "\$MIN_INTERVAL_S" ]; then
-  exit 0
+  defer interval
 fi
-# Gate 1: atomic claim. Losers exit; a gate older than 15 min is stale
-# (crashed run) and gets reclaimed.
+# Gate 1: atomic claim. Losers queue their review; a gate older than 15 min
+# is stale (crashed run) and gets reclaimed. The holder refreshes ts before
+# each run it drains, so a long drain is never mistaken for a crash.
 if ! mkdir "\$GATE" 2>/dev/null; then
   GAGE=\$(cat "\$GATE/ts" 2>/dev/null || echo 0)
   case "\$GAGE" in ''|*[!0-9]*) GAGE=0 ;; esac
   if [ \$((NOW - GAGE)) -gt 900 ]; then
     rm -rf "\$GATE"
-    mkdir "\$GATE" 2>/dev/null || exit 0
+    mkdir "\$GATE" 2>/dev/null || defer busy
   else
-    exit 0
+    defer busy
   fi
 fi
 printf '%s\\n' "\$NOW" > "\$GATE/ts" 2>/dev/null
@@ -389,33 +499,75 @@ if [ -z "\$OC" ]; then
   elif command -v opencode2 >/dev/null 2>&1; then OC=opencode2
   else OC=opencode; fi
 fi
-# pi branch: one-shot print-mode review, ephemeral (--no-session),
-# project-local resources ignored (-na), review md piped on stdin.
-if [ "\$(basename "\$OC")" = "pi" ]; then
-  "\$OC" -p --no-session -na < "\$REVIEW_FILE" >/dev/null 2>&1
-  AL_CLI="\$HOME/.agents/skills/autolearn/scripts/autolearn.py"
-  [ -f "\$AL_CLI" ] || AL_CLI="\$HOME/.agents/skills/autolearn-reviewer/scripts/autolearn.py"
-  if [ -n "\${AUTOLEARN_SYNC_API_KEY:-}" ] && [ -f "\${HOME}/.autolearn/.encryption_salt" ] && [ -f "\$AL_CLI" ]; then
-    uv run "\$AL_CLI" sync push >/dev/null 2>&1
+# run_review FILE [harness args...]: run one review and keep its per-step
+# accounting (<review>.run.jsonl) and stderr tail (<review>.run.err) next to
+# the review so completion, steps and cost are measurable offline
+# (RL-OPS-005). AUTOLEARN_REVIEW_ID reaches the reviewer's shell, so its
+# "log review-complete" joins this run exactly (RL-OPS-004).
+run_review() {
+  RF="\$1"
+  shift
+  BASE="\${RF%.md}"
+  RID=\$(basename "\$BASE")
+  T0=\$(date +%s)
+  printf '%s\\n' "\$T0" > "\$GATE/ts" 2>/dev/null
+  runlog started "\$RF" ""
+  SID=""
+  if [ "\$(basename "\$OC")" = "pi" ]; then
+    # pi branch: one-shot print-mode review, ephemeral (--no-session),
+    # project-local resources ignored (-na), review md piped on stdin.
+    AUTOLEARN_REVIEW_ID="\$RID" "\$OC" -p --no-session -na < "\$RF" >/dev/null 2> "\$BASE.run.err"
+    RC=\$?
+  else
+    OUT=\$(mktemp "\${TMPDIR:-/tmp}/alreview.XXXXXX")
+    AUTOLEARN_REVIEW_ID="\$RID" "\$OC" run --format json "\$@" < "\$RF" > "\$OUT" 2> "\$BASE.run.err"
+    RC=\$?
+    # BRE backslashes below are DOUBLED (\\\\, \\1) because this script lives
+    # inside a JS template literal — single backslashes get eaten by the escape
+    # evaluation (\\( -> ( , \\1 -> 0x01 control char under Bun) and the sed
+    # silently extracts nothing (issue #15).
+    # Output contract (verified against opencode v1.0.142..v1.18.31 and v2.0.3):
+    # both binaries emit "run --format json" as JSONL with a top-level
+    # "sessionID" on every line, so line-by-line sed extraction is safe.
+    SID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$OUT" | head -1)
+    # Keep only step accounting and errors: full tool output would add
+    # megabytes per review to the store.
+    grep -E '"type" *: *"(step_finish|step-finish|error)"' "\$OUT" > "\$BASE.run.jsonl" 2>/dev/null
+    rm -f "\$OUT"
+    if [ -n "\$SID" ]; then
+      # both v1 and v2 ship 'session delete'; the old v2 HTTP form needed
+      # MSYS_NO_PATHCONV, which silently broke the Git Bash shim (cmd //c).
+      "\$OC" session delete "\$SID" >/dev/null 2>>"\$BASE.run.err"
+    fi
   fi
-  exit 0
-fi
-OUT=\$(mktemp "\${TMPDIR:-/tmp}/alreview.XXXXXX")
-"\$OC" run --format json "\$@" < "\$REVIEW_FILE" > "\$OUT" 2>/dev/null
-# BRE backslashes below are DOUBLED (\\\\, \\1) because this script lives
-# inside a JS template literal — single backslashes get eaten by the escape
-# evaluation (\\( -> ( , \\1 -> 0x01 control char under Bun) and the sed
-# silently extracts nothing (issue #15).
-# Output contract (verified against opencode v1.0.142..v1.18.31 and v2.0.3):
-# both binaries emit "run --format json" as JSONL with a top-level
-# "sessionID" on every line, so line-by-line sed extraction is safe.
-SID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$OUT" | head -1)
-rm -f "\$OUT"
-if [ -n "\$SID" ]; then
-  # both v1 and v2 ship 'session delete'; the old v2 HTTP form needed
-  # MSYS_NO_PATHCONV, which silently broke the Git Bash shim (cmd //c).
-  "\$OC" session delete "\$SID" >/dev/null 2>>"\$BASE.run.err"
-fi
+  if [ -s "\$BASE.run.err" ]; then
+    tail -c 4000 "\$BASE.run.err" > "\$BASE.run.err.t" 2>/dev/null && mv "\$BASE.run.err.t" "\$BASE.run.err" 2>/dev/null
+  else
+    rm -f "\$BASE.run.err"
+  fi
+  HAS_SID=false
+  [ -n "\$SID" ] && HAS_SID=true
+  runlog finished "\$RF" ',"rc":'"\$RC"',"duration_s":'"\$(( \$(date +%s) - T0 ))"',"session":'"\$HAS_SID"
+}
+run_review "\$REVIEW_FILE" "\$@"
+# Drain reviews other wrappers queued while we held the gate (RL-OPS-002).
+DRAINED=0
+for P in "\$PENDING"/*.md; do
+  [ -f "\$P" ] || continue
+  [ "\$DRAINED" -lt "\$DRAIN_MAX" ] || break
+  N=\$(basename "\$P" .md)
+  TSMS=\${N##*-}
+  case "\$TSMS" in ''|*[!0-9]*) TSMS=0 ;; esac
+  if [ \$(( \$(date +%s) - TSMS / 1000 )) -gt "\$PENDING_MAX_AGE_S" ]; then
+    rm -f "\$P"
+    runlog expired "\$P" ""
+    continue
+  fi
+  mv "\$P" "\$REVIEWS/" 2>/dev/null || continue
+  runlog drained "\$P" ""
+  run_review "\$REVIEWS/\$N.md" "\$@"
+  DRAINED=\$((DRAINED + 1))
+done
 # Push after review completes so reviewer-written changes are included.
 # Stays silent when sync isn't configured (no API key or no salt).
 AL_CLI="\$HOME/.agents/skills/autolearn/scripts/autolearn.py"
@@ -538,30 +690,48 @@ export function truncate(text, maxLen) {
 }
 
 // @spec MI-CMP-009, MI-CMP-010
+function instructionKey(p) {
+  const s = String(p).replaceAll("\\", "/")
+  return process.platform === "win32" ? s.toLowerCase() : s
+}
+
 export function injectInstructions() {
   try {
-    const configPath = join(homedir(), ".config", "opencode", "opencode.json")
+    // AUTOLEARN_OPENCODE_CONFIG redirects the patched config (tests, sandboxes).
+    const configPath = process.env.AUTOLEARN_OPENCODE_CONFIG || join(homedir(), ".config", "opencode", "opencode.json")
     if (!existsSync(configPath)) return
     const raw = readFileSync(configPath, "utf-8")
     const data = JSON.parse(raw)
     if (!data.instructions) data.instructions = []
 
     // Remove superseded memory instruction paths (flat-layout + persona memory.md).
-    // Memory Insight loads the generated memory.context.md instead. Matches
-    // both expanded absolute paths and literal-tilde forms.
+    // Memory Insight loads the generated memory.context.md instead. Compare by
+    // normalized key so slash style and Windows case do not defeat the match.
     const oldMemoryFile = join(AL_HOME, "memory.md")
-    const legacyForms = new Set([oldMemoryFile, LEGACY_MEMORY_FILE])
+    const legacyKeys = new Set([oldMemoryFile, LEGACY_MEMORY_FILE].map(instructionKey))
     try {
-      legacyForms.add(join(homedir(), ".autolearn", "memory.md").replace(homedir(), "~"))
-      legacyForms.add(LEGACY_MEMORY_FILE.replace(homedir(), "~"))
+      legacyKeys.add(instructionKey(join(homedir(), ".autolearn", "memory.md").replace(homedir(), "~")))
+      legacyKeys.add(instructionKey(LEGACY_MEMORY_FILE.replace(homedir(), "~")))
     } catch {}
-    const hadSuperseded = data.instructions.some(p => legacyForms.has(p))
+    const hadSuperseded = data.instructions.some(p => legacyKeys.has(instructionKey(p)))
     let changed = hadSuperseded
     if (hadSuperseded) {
-      data.instructions = data.instructions.filter(p => !legacyForms.has(p))
+      data.instructions = data.instructions.filter(p => !legacyKeys.has(instructionKey(p)))
     }
 
-    if (!data.instructions.includes(MEMORY_FILE)) {
+    // Collapse equivalent entries (forward vs back slashes, Windows case).
+    const beforeDedupe = data.instructions.length
+    const seen = new Set()
+    data.instructions = data.instructions.filter((p) => {
+      const key = instructionKey(p)
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    if (data.instructions.length !== beforeDedupe) changed = true
+
+    const memoryKey = instructionKey(MEMORY_FILE)
+    if (!data.instructions.some(p => instructionKey(p) === memoryKey)) {
       data.instructions.push(MEMORY_FILE)
       changed = true
     }
@@ -583,16 +753,185 @@ export function composeContext() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Per-session archive slice (RL-MEM-005). memory.context.md carries only the
+// hard-capped core (every harness injects it via `instructions`). The v1
+// shell adds the archive entries relevant to THIS session through
+// experimental.chat.system.transform, computed once and frozen per session
+// so the system prompt stays byte-stable (prefix cache). Python owns the
+// policy and exports records + params to memory.archive.json; the ranking
+// below mirrors memlayers.rank_score / archive_slice.
+export const ARCHIVE_INDEX_FILE = join(DEFAULT_PERSONA_DIR, "memory.archive.json")
+const archiveCache = { path: null, mtimeMs: -1, doc: null }
+
+export function loadArchiveIndex(path = ARCHIVE_INDEX_FILE) {
+  try {
+    const st = statSync(path)
+    if (archiveCache.path !== path || archiveCache.mtimeMs !== st.mtimeMs) {
+      archiveCache.doc = JSON.parse(readFileSync(path, "utf-8"))
+      archiveCache.mtimeMs = st.mtimeMs
+      archiveCache.path = path
+    }
+    return archiveCache.doc
+  } catch {
+    return null
+  }
+}
+
+export function contextTokens(text, stopwords = []) {
+  const stop = new Set(stopwords)
+  const out = new Set()
+  for (const t of String(text || "").toLowerCase().match(/[a-z0-9]+/g) || []) {
+    if (t.length >= 2 && !stop.has(t)) out.add(t)
+  }
+  return out
+}
+
+// BM25 over the archive (binary tf), mirroring memlayers.bm25 / search /
+// archive_slice: rare shared terms dominate, long entries are normalized.
+export function archiveSlice(contextText, doc = loadArchiveIndex()) {
+  if (!doc || !Array.isArray(doc.records) || !doc.stats) return []
+  const p = doc.params || {}
+  const sliceChars = p.slice_chars ?? 1500
+  const sliceMax = p.slice_max ?? 6
+  const minScore = p.min_score ?? 8
+  const minOverlap = p.min_overlap ?? 2
+  const k1 = p.k1 ?? 1.2
+  const b = p.b ?? 0.75
+  const { n, avgdl, df } = doc.stats
+  const ctx = contextTokens(contextText, doc.stopwords || [])
+  if (!ctx.size || !n) return []
+  const scored = []
+  for (const rec of doc.records) {
+    const toks = rec.topics || []
+    if (!toks.length) continue
+    const norm = 1 - b + b * (toks.length / (avgdl || 1))
+    const tfPart = (k1 + 1) / (1 + k1 * norm)
+    let score = 0
+    let overlap = 0
+    for (const t of toks) {
+      if (!ctx.has(t)) continue
+      overlap++
+      const d = df[t] || 0
+      score += Math.log(1 + (n - d + 0.5) / (d + 0.5)) * tfPart
+    }
+    if (overlap < minOverlap || score <= 0) continue
+    const ret = rec.retention == null ? 0.5 : Number(rec.retention)
+    scored.push({ rec, score: score * (0.75 + 0.25 * ret) })
+  }
+  scored.sort((a, c) => c.score - a.score)
+  const chosen = []
+  let used = 0
+  for (const { rec, score } of scored) {
+    if (score < minScore) break
+    const cost = `- ${rec.text}\n`.length
+    if (used + cost > sliceChars) continue
+    chosen.push(rec)
+    used += cost
+    if (chosen.length >= sliceMax) break
+  }
+  return chosen
+}
+
+export function formatArchiveSlice(records) {
+  if (!records || !records.length) return ""
+  let out = "# Autolearn: memories relevant to this session\n\n"
+  out += "<!-- Retrieved from the autolearn archive for this project/request. -->\n\n"
+  for (const r of records) out += `- ${r.text}\n`
+  return out
+}
+
+// Session context for relevance: project label, directory segments, the git
+// origin URL (repo name is often the best signal), and the first user message.
+export function sessionContextText({ directory, firstMessage } = {}) {
+  // The home directory's own name (the username) matches nothing useful and
+  // its path segments only add noise, so it contributes no project label.
+  const label = projectLabel(directory)
+  const parts = [label.toLowerCase() === projectLabel(homedir()).toLowerCase() ? "" : label]
+  try {
+    const cfg = readFileSync(join(directory, ".git", "config"), "utf-8")
+    const m = cfg.match(/\[remote "origin"\][^[]*?url\s*=\s*(\S+)/)
+    if (m) parts.push(m[1].replace(/[/:.]+/g, " "))
+  } catch {}
+  if (firstMessage) parts.push(String(firstMessage).slice(0, 2000))
+  return parts.join(" ")
+}
+
+// ---------------------------------------------------------------------------
+// Tool notes (RL-INP-002, RL-SKL-007). Built from tool.execute.after: the
+// strongest learning signal is "a call failed -> the user redirected", and
+// the reviewer only ever saw the prose around it. Notes are compact and
+// redacted; successful calls produce none except skill loads/edits.
+const SKILL_FILE_RE = /[\\/]skills[\\/]([^\\/]+)[\\/](?:SKILL\.md|references[\\/][^\\/]+)$/i
+
+function lastLines(text, n = 6) {
+  return String(text || "").trim().split(/\r?\n/).slice(-n).join(" | ")
+}
+
+export function toolNote(input = {}, output = {}) {
+  const tool = String(input.tool || "")
+  const args = input.args || {}
+  const meta = output.metadata || {}
+  if (tool === "skill") {
+    const name = args.name || args.id
+    return name ? { kind: "skill_load", skill: String(name), text: `[skill] loaded ${name}` } : null
+  }
+  const filePath = args.filePath || args.file_path || args.path || ""
+  const m = typeof filePath === "string" ? filePath.match(SKILL_FILE_RE) : null
+  if (m && /^(edit|write|patch|multiedit|apply_patch)$/i.test(tool)) {
+    return { kind: "skill_edit", skill: m[1], text: `[skill-edit] ${m[1]} via ${tool}` }
+  }
+  const out = typeof output.output === "string" ? output.output : ""
+  const exit = meta.exit ?? meta.exitCode
+  const failed = (exit != null && Number(exit) !== 0) || /^\s*error\b/i.test(out)
+  if (!failed) return null
+  const what = tool === "bash" ? (args.command || "") : (filePath || args.pattern || args.url || JSON.stringify(args))
+  const status = exit != null ? `exit ${exit}` : "error"
+  return {
+    kind: "tool_error",
+    text: `[tool error] ${tool}: ${redact(truncate(String(what), 200))} -> ${status}: ${redact(truncate(lastLines(out), 300))}`,
+  }
+}
+
+// Pending skill proposals (staged by the reviewer, which may not edit skills
+// itself) surface at the moment a session LOADS that skill: the agent that
+// is using it has the evidence to apply or reject them (RL-SKL-002).
+export const SKILL_PROPOSALS_FILE = join(SKILLS_DIR, ".proposals.json")
+
+export function pendingProposalsNote(skill, { file = SKILL_PROPOSALS_FILE, max = 3 } = {}) {
+  let items = []
+  try { items = JSON.parse(readFileSync(file, "utf-8")) } catch { return "" }
+  const mine = (Array.isArray(items) ? items : []).filter(p => p && p.status === "pending" && p.skill === skill)
+  if (!mine.length) return ""
+  let out = `\n\n<autolearn-proposals skill="${skill}">\n`
+  out += `${mine.length} pending improvement(s) for this skill were staged from earlier sessions. `
+  out += "If what you observe while using the skill confirms one, apply it; if it is wrong, reject it with the reason:\n"
+  for (const p of mine.slice(0, max)) {
+    if (p.kind === "edit") {
+      out += `- ${p.id} (${p.file || "SKILL.md"}): replace "${truncate(String(p.old || ""), 160)}" with "${truncate(String(p.new || ""), 240)}" — reason: ${truncate(String(p.reason || ""), 200)}\n`
+    } else {
+      out += `- ${p.id}: full rewrite staged (${p.old_chars} -> ${p.new_chars} chars) — reason: ${truncate(String(p.reason || ""), 200)}\n`
+    }
+  }
+  out += `Apply: uv run "${AUTOLEARN_CLI}" skill apply <id>   Reject: uv run "${AUTOLEARN_CLI}" skill reject <id> --reason "<why>"\n</autolearn-proposals>`
+  return out
+}
+
 export const MAX_OBS_LINES = 1000
 
 // @spec KS-OBS-001, KS-OBS-002, KS-OBS-003
 export function logObs(obs) {
   obs.timestamp = new Date().toISOString()
+  if (!obs.design) obs.design = DESIGN_VERSION
   try {
-    // @spec KS-OBS-005
-    appendFileSync(OBS_FILE, JSON.stringify(obs) + "\n")
-    // @spec KS-OBS-004
-    trimFile(OBS_FILE, MAX_OBS_LINES)
+    // Append + trim under the store lock: the Python CLI appends and trims
+    // the same file, and an unlocked trim silently drops concurrent appends.
+    withStoreLock(() => {
+      // @spec KS-OBS-005
+      appendFileSync(OBS_FILE, JSON.stringify(obs) + "\n")
+      // @spec KS-OBS-004
+      trimFile(OBS_FILE, MAX_OBS_LINES)
+    })
   } catch {
     // @spec KS-OBS-006
   }
@@ -605,7 +944,9 @@ export function trimFile(filePath, maxLines) {
     const lines = content.split("\n")
     if (lines.length <= maxLines) return
     const trimmed = lines.slice(-maxLines).join("\n")
-    writeFileSync(filePath, trimmed)
+    const tmp = `${filePath}.${process.pid}.tmp`
+    writeFileSync(tmp, trimmed)
+    renameSync(tmp, filePath)
     dbg("TRIMMED", filePath, "from", lines.length, "to", maxLines, "lines")
   } catch {}
 }
@@ -618,7 +959,12 @@ export function formatReview(messages, meta = {}) {
   md += `- Project: ${project}\n`
   md += `- Date: ${new Date().toISOString()}\n`
   md += `- Turns in this review: ${messages.length}\n`
-  md += `- Trigger: ${trigger}\n\n`
+  md += `- Trigger: ${trigger}\n`
+  md += `- Design: ${DESIGN_VERSION}\n`
+  // RL-INP-002: the reviewer must know which skills were actually used — it
+  // stages proposals only for those, and never patches blind.
+  const loaded = [...(meta.loadedSkills || [])]
+  md += `- Skills loaded in this conversation: ${loaded.length ? loaded.join(", ") : "none"}\n\n`
   md += "## Instructions\n\n"
   md += "Review the conversation below for learning opportunities.\n"
   md += "Load the autolearn skill and follow references/reviewer.md for the\n"
@@ -641,7 +987,7 @@ export function formatReview(messages, meta = {}) {
   md += "## Conversation\n\n"
 
   for (const msg of messages) {
-    const label = msg.role === "user" ? "User" : "Assistant"
+    const label = msg.role === "user" ? "User" : msg.role === "tool" ? "Tool" : "Assistant"
     md += `### ${label}\n\n${msg.content}\n\n`
   }
 
@@ -654,21 +1000,19 @@ export function cleanStaleReviews(config) {
   try {
     const staleMs = (config.stale_after_days || STALE_DAYS_DEFAULT) * 86400000
     const now = Date.now()
-    const files = []
-    try {
-      for (const f of readdirSync(REVIEWS_DIR)) {
-        files.push(f)
-      }
-    } catch {
-      return
-    }
-    for (const f of files) {
-      if (!f.startsWith("review-")) continue
-      const match = f.match(/review-(?:exit-)?(\d+)\.md/)
-      if (!match) continue
-      const fileTime = parseInt(match[1], 10)
-      if (now - fileTime > staleMs) {
-        try { unlinkSync(join(REVIEWS_DIR, f)); dbg("CLEANED STALE REVIEW", f) } catch {}
+    // The review markdown plus its run sidecars (<id>.run.jsonl / .run.err,
+    // RL-OPS-005), in the reviews dir and the pending queue.
+    for (const dir of [REVIEWS_DIR, join(REVIEWS_DIR, "pending")]) {
+      let files = []
+      try { files = readdirSync(dir) } catch { continue }
+      for (const f of files) {
+        if (!f.startsWith("review-")) continue
+        const match = f.match(/^review-(?:exit-)?(\d+)\.(?:md|run\.jsonl|run\.err)$/)
+        if (!match) continue
+        const fileTime = parseInt(match[1], 10)
+        if (now - fileTime > staleMs) {
+          try { unlinkSync(join(dir, f)); dbg("CLEANED STALE REVIEW", f) } catch {}
+        }
       }
     }
   } catch (err) {
@@ -710,7 +1054,34 @@ export function contentHash(str) {
   return (h >>> 0).toString(16)
 }
 
+// The wrapper's single-flight claim. A fresh claim means a review is running
+// right now (median ~5 min, p90 ~17 min in production) — handing the wrapper
+// another review would only get it queued, so the peek keeps the buffer
+// instead and the content rides the next trigger (RL-OPS-003).
+export const WRAPPER_GATE_DIR = join(AL_HOME, ".review_gate")
+export const WRAPPER_GATE_STALE_MS = 900000
+
+export function wrapperBusy(now = Date.now(), gateDir = WRAPPER_GATE_DIR) {
+  try {
+    if (!existsSync(gateDir)) return false
+    const ts = parseInt(readFileSync(join(gateDir, "ts"), "utf-8").trim(), 10) || 0
+    return now - ts * 1000 < WRAPPER_GATE_STALE_MS
+  } catch {
+    return false
+  }
+}
+
 export function throttleCheck(reviewMd, commit = true) {
+  return throttleVerdict(reviewMd, { commit }).ok
+}
+
+/**
+ * Like throttleCheck, but returns `{ ok, reason }` so callers can tell a
+ * permanent refusal (duplicate content, daily cap) from a transient one
+ * (busy wrapper, interval) that should be retried or queued.
+ * `checkBusy` makes the peek treat a running review as transient-busy.
+ */
+export function throttleVerdict(reviewMd, { commit = true, checkBusy = false } = {}) {
   // Hash the CONVERSATION section only, not the whole md: the Context header
   // (project name, timestamp) varies between plugin instances that observed
   // the same conversation, and those variants must still dedupe — that is
@@ -729,7 +1100,12 @@ export function throttleCheck(reviewMd, commit = true) {
 
   if (contentHash(dedupeKey) === lastHash) {
     dbg("THROTTLED: identical review content already spawned")
-    return false
+    return { ok: false, reason: "duplicate" }
+  }
+
+  if (checkBusy && wrapperBusy()) {
+    dbg("THROTTLED: a review is running (wrapper gate held)")
+    return { ok: false, reason: "busy" }
   }
 
   const config = parseConfig()
@@ -738,7 +1114,7 @@ export function throttleCheck(reviewMd, commit = true) {
   const gap = now - lastMs
   if (gap < minInterval) {
     dbg("THROTTLED: global min_interval_ms", gap, "<", minInterval)
-    return false
+    return { ok: false, reason: "interval" }
   }
 
   // Daily cap across all projects: reviews spawned today (file timestamps)
@@ -756,7 +1132,7 @@ export function throttleCheck(reviewMd, commit = true) {
     } catch {}
     if (today >= dailyCap) {
       dbg("THROTTLED: daily cap reached", today, ">=", dailyCap)
-      return false
+      return { ok: false, reason: "daily_cap" }
     }
   }
 
@@ -766,8 +1142,11 @@ export function throttleCheck(reviewMd, commit = true) {
   if (commit) {
     try { writeFileSync(THROTTLE_FILE, `${now}:${contentHash(dedupeKey)}`) } catch {}
   }
-  return true
+  return { ok: true, reason: null }
 }
+
+// Transient refusals: the content is new, just not runnable right now.
+const TRANSIENT_THROTTLE = new Set(["busy", "interval"])
 
 /**
  * Activity-coupled curator trigger (issue #23): decide whether the curator is
@@ -806,6 +1185,19 @@ export function curatorDue({ config = parseConfig(), now = Date.now(), stateFile
  * enforces the real single-flight gate; this side adds the spawn cooldown
  * so a dead curator run is not re-attempted on every review.
  */
+// The curator gets its own agent (larger step budget) when the installer
+// defined one; otherwise the wrapper falls back to the reviewer agent.
+export function curatorAgentName() {
+  const cfg = parseConfig()
+  if (cfg.curator_agent) return String(cfg.curator_agent)
+  try {
+    const configPath = process.env.AUTOLEARN_OPENCODE_CONFIG || join(homedir(), ".config", "opencode", "opencode.json")
+    const data = JSON.parse(readFileSync(configPath, "utf-8"))
+    if (data?.agent?.["autolearn-curator"]) return "autolearn-curator"
+  } catch {}
+  return null
+}
+
 export function maybeSpawnCurator({ cwd, project, env, spawnFn, now = Date.now(), config, stateFile, cooldownFile } = {}) {
   try {
     const verdict = curatorDue({ ...(config ? { config } : {}), now, ...(stateFile ? { stateFile } : {}), ...(cooldownFile ? { cooldownFile } : {}) })
@@ -821,9 +1213,10 @@ export function maybeSpawnCurator({ cwd, project, env, spawnFn, now = Date.now()
     // per harness family, and dropping the pin would let the wrapper's PATH
     // fallback route a v1-pinned curator to opencode2 (or pi) — the binary-
     // shadowing failure mode. AUTOLEARN_CURATOR marks the run for debugging.
+    const curatorAgent = curatorAgentName()
     spawn(wrapperCommand(["--curator"]), {
       cwd: cwd || process.cwd(),
-      env: { ...process.env, AUTOLEARN_CURATOR: "1", ...(env || {}) },
+      env: { ...process.env, AUTOLEARN_CURATOR: "1", ...(curatorAgent ? { AUTOLEARN_CURATOR_AGENT: curatorAgent } : {}), ...(env || {}) },
     })
     const obs = { type: "curator_triggered", project: project || "unknown", interval_days: verdict.intervalDays }
     if (verdict.lastRunMs) obs.last_run = new Date(verdict.lastRunMs).toISOString().slice(0, 10)
@@ -845,30 +1238,58 @@ export function maybeSpawnCurator({ cwd, project, env, spawnFn, now = Date.now()
  * callers can write the fallback file.
  */
 // @spec CM-RS-007..CM-RS-013
-export function runReviewSubprocess({ reviewMd, filePrefix = "review", title, cwd, env, messageCount, project, trigger, log = true }) {
+export const PENDING_DIR = join(REVIEWS_DIR, "pending")
+
+// Extra harness args for the review run from config (RL-INP-003):
+// reviewer_model -> --model, reviewer_variant -> --variant.
+export function reviewerArgs(config = parseConfig()) {
+  const out = []
+  if (config.reviewer_model) out.push("--model", String(config.reviewer_model))
+  if (config.reviewer_variant) out.push("--variant", String(config.reviewer_variant))
+  return out
+}
+
+export function runReviewSubprocess({ reviewMd, filePrefix = "review", title, cwd, env, messageCount, project, trigger, log = true, queueIfThrottled = false }) {
   // Cross-process throttle first: identical content never reviews twice, any
   // two reviews are separated by min_interval_ms (default 3 min), and a
   // daily cap bounds total provider spend.
   // @spec CM-RS-020
-  if (!throttleCheck(reviewMd)) {
-    dbg("REVIEW SUPPRESSED by throttle", { project, trigger })
-    if (log) {
-      logObs({ type: "review_throttled", project: project || "unknown", trigger: trigger || "unknown" })
+  const verdict = throttleVerdict(reviewMd)
+  if (!verdict.ok) {
+    // Callers that cannot retry later (the exit review: the session is
+    // ending and its buffer dies with it) queue transient refusals for the
+    // next wrapper run to drain instead of dropping them (RL-OPS-002).
+    if (queueIfThrottled && TRANSIENT_THROTTLE.has(verdict.reason)) {
+      try {
+        mkdirSync(PENDING_DIR, { recursive: true })
+        const queued = join(PENDING_DIR, `${filePrefix}-${Date.now()}.md`)
+        writeFileSync(queued, reviewMd)
+        logObs({ type: "review_deferred", review_id: queued.split(/[\\/]/).pop().replace(/\.md$/, ""), reason: verdict.reason, project: project || "unknown", trigger: trigger || "unknown" })
+        dbg("REVIEW QUEUED (throttled:", verdict.reason + ")", queued)
+        return { ok: false, reviewFile: queued, reviewMd, throttled: true, queued: true, reason: verdict.reason }
+      } catch (err) {
+        dbg("REVIEW QUEUE FAILED", err.message)
+      }
     }
-    return { ok: false, reviewFile: null, reviewMd, throttled: true }
+    dbg("REVIEW SUPPRESSED by throttle", { project, trigger, reason: verdict.reason })
+    if (log) {
+      logObs({ type: "review_throttled", reason: verdict.reason, project: project || "unknown", trigger: trigger || "unknown" })
+    }
+    return { ok: false, reviewFile: null, reviewMd, throttled: true, reason: verdict.reason }
   }
 
   // @spec CM-RS-007
   const reviewFile = join(REVIEWS_DIR, `${filePrefix}-${Date.now()}.md`)
   writeFileSync(reviewFile, reviewMd)
   dbg("REVIEW FILE WRITTEN", reviewFile)
+  const reviewId = reviewFile.split(/[\\/]/).pop().replace(/\.md$/, "")
 
   // @spec CM-RS-008, CM-RS-009, CM-RS-010
   // Pass the review FILE PATH, not the content: the wrapper streams the file
   // to the harness on stdin. Content-as-argv exceeds the Windows command-line
   // limit (32,767 chars) once the review passes ~32 KB and the spawn dies
   // with ENAMETOOLONG (issue #21).
-  const args = [reviewFile, "--agent", "autolearn-reviewer", "--title", title]
+  const args = [reviewFile, "--agent", "autolearn-reviewer", "--title", title, ...reviewerArgs()]
   spawnDetached(wrapperCommand(args), {
     cwd: cwd || process.cwd(),
     env: { ...process.env, AUTOLEARN_REVIEWER: "1", ...(env || {}) },
@@ -876,7 +1297,7 @@ export function runReviewSubprocess({ reviewMd, filePrefix = "review", title, cw
 
   // @spec CM-RS-013
   if (log) {
-    const obs = { type: "review_spawned", review_file: reviewFile }
+    const obs = { type: "review_spawned", review_file: reviewFile, review_id: reviewId }
     if (typeof messageCount === "number") obs.message_count = messageCount
     obs.project = project || "unknown"
     if (trigger) obs.trigger = trigger

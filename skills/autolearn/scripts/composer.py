@@ -12,6 +12,8 @@ import os
 import re
 from pathlib import Path
 
+import storelock
+
 import registry
 from registry import MemoryRegistry
 
@@ -45,12 +47,34 @@ def retention(record: dict) -> float:
     return 0.5 if score is None else float(score)
 
 
+def compose_core(records: list[dict], caps: dict | None = None) -> str:
+    """Two-tier view (RL-MEM-004): every core entry, pinned first, by retention.
+
+    Caps are enforced when entries are WRITTEN (memlayers.admit); here they
+    are only a ceiling for stores whose config was lowered after the fact.
+    """
+    core = [r for r in records if r.get("layer") == "core"]
+    core.sort(key=lambda r: (bool(r.get("pinned")), retention(r)), reverse=True)
+    used = {"memory": 0, "user": 0}
+    out = HEADER
+    for rec in core:
+        t = "user" if rec.get("type") == "user" else "memory"
+        line = f"- {rec.get('text', '')}\n"
+        if caps and not rec.get("pinned") and used[t] + len(line) > caps.get(t, 10 ** 9):
+            continue
+        used[t] += len(line)
+        out += line
+    return out
+
+
 # @spec MI-CMP-001, MI-CMP-002, MI-CMP-003, MI-CMP-004, MI-CMP-005, MI-CMP-007, MI-CMP-008
 def compose(registry_obj: MemoryRegistry, ctx_tokens: set[str],
             config: dict = DEFAULT_CONFIG) -> str:
     records = registry_obj.load_active()
     if not records:
         return HEADER  # MI-CMP-008
+    if any(r.get("layer") for r in records):
+        return compose_core(records, config.get("core_caps"))
 
     pinned = [r for r in records if r.get("pinned")]
     others = [r for r in records if not r.get("pinned")]
@@ -94,9 +118,7 @@ def cmd_compose(args):
 
     md = compose(reg, ctx_tokens)
     out_path = persona_dir / "memory.context.md"
-    tmp = out_path.with_suffix(out_path.suffix + f".{os.getpid()}.tmp")
-    tmp.write_text(md, encoding="utf-8")
-    os.replace(tmp, out_path)
+    storelock.atomic_write_text(out_path, md)
 
     n_entries = max(0, md.count("\n- "))
     print(f"Wrote {out_path} ({n_entries} entries, {len(md)} chars)")

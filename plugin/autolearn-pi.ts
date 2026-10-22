@@ -72,7 +72,7 @@ export default function autolearnPi(pi: ExtensionAPI) {
   let memoryAppended = false
   let cwd = process.cwd()
 
-  const projectName = () => cwd.split("/").pop() || "unknown"
+  const projectName = () => core.projectLabel(cwd)
 
   // Extract plain text from a pi message `content` (string or content blocks).
   function textOf(content: any): string {
@@ -106,7 +106,7 @@ export default function autolearnPi(pi: ExtensionAPI) {
     // PEEK ONLY (commit: false) — runReviewSubprocess owns the committing
     // gate; a committing pre-check would self-cancel every review (issue #14).
     const reviewMd = core.formatReview(buffer, { project: projectName(), trigger })
-    if (!core.throttleCheck(reviewMd, false)) {
+    if (!core.throttleVerdict(reviewMd, { commit: false, checkBusy: true }).ok) {
       core.dbg("REVIEW QUEUED by throttle (pi)", buffer.length, "messages, trigger", trigger)
       return
     }
@@ -161,7 +161,11 @@ export default function autolearnPi(pi: ExtensionAPI) {
         title: "autolearn exit review",
         cwd,
         env: { AUTOLEARN_HARNESS_BIN: "pi" },
-        log: false, // exit path stays silent, matching the other shells
+        // Logged and queued-if-throttled like the v1 shell (RL-OPS-002).
+        trigger: "exit",
+        messageCount: captured.length,
+        project: projectName(),
+        queueIfThrottled: true,
       })
       core.dbg("EXIT REVIEW SPAWNED (pi)", captured.length, "messages")
     } catch (err: any) {
