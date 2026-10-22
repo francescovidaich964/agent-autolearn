@@ -412,7 +412,7 @@ OUT=\$(mktemp "\${TMPDIR:-/tmp}/alreview.XXXXXX")
 SID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$OUT" | head -1)
 rm -f "\$OUT"
 if [ -n "\$SID" ]; then
-  # both v1 and v2 ship `session delete`; the old v2 HTTP form needed
+  # both v1 and v2 ship 'session delete'; the old v2 HTTP form needed
   # MSYS_NO_PATHCONV, which silently broke the Git Bash shim (cmd //c).
   "\$OC" session delete "\$SID" >/dev/null 2>>"\$BASE.run.err"
 fi
