@@ -184,6 +184,17 @@ export function projectLabel(dir) {
 }
 
 // @spec KS-MEM-001 (ensures directory tree exists before any operation)
+// Reviewer sessions run in a scratch directory, not the workspace: harness
+// UIs that list sessions per workspace cwd (e.g. Devin Desktop Spaces via
+// ACP session/list) would otherwise surface every review as a conversation.
+// Review content still targets the real project (absolute paths); only the
+// session's directory differs. Override with AUTOLEARN_REVIEW_CWD.
+export function reviewerCwd() {
+  const dir = process.env.AUTOLEARN_REVIEW_CWD || join(AL_HOME, "reviewer-cwd")
+  try { mkdirSync(dir, { recursive: true }) } catch {}
+  return dir
+}
+
 export function ensureStore() {
   migrateToPersonas()
   mkdirSync(DEFAULT_PERSONA_DIR, { recursive: true })
@@ -332,8 +343,8 @@ export function wrapperCommand(args, platform = process.platform) {
 // `opencode2`, the pi shell pins `pi`), falling back to
 // AUTOLEARN_OPENCODE_BIN (legacy name, still honored), then to detection.
 // pi runs reviews as one-shot print-mode processes with --no-session, so no
-// session cleanup is needed; opencode keeps the run/delete dance (v2 via the
-// HTTP API, which has no `session delete` CLI subcommand).
+// session cleanup is needed; opencode keeps the run/delete dance (both v1 and
+// v2 ship `session delete` - the v2 HTTP form broke on Windows, see run_review).
 const WRAPPER_CONTENT = `#!/bin/sh
 # Autolearn review runner - runs an opencode review, deletes the session,
 # then pushes the updated store via sync (if configured).
@@ -388,6 +399,7 @@ if [ "\$1" = "--curator" ]; then
   printf '%s\\n' "\$NOW" > "\$CGATE/ts" 2>/dev/null
   trap 'rm -rf "\$CGATE" 2>/dev/null' EXIT
   OC="\${AUTOLEARN_HARNESS_BIN:-\${AUTOLEARN_OPENCODE_BIN:-}}"
+  if [ -n "\$OC" ] && ! command -v "\$OC" >/dev/null 2>&1; then OC=""; fi
   if [ -z "\$OC" ]; then
     if command -v pi >/dev/null 2>&1; then OC=pi
     elif command -v opencode2 >/dev/null 2>&1; then OC=opencode2
@@ -402,10 +414,7 @@ if [ "\$1" = "--curator" ]; then
     CSID=\$(sed -n 's/.*"sessionID"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "\$COUT" | head -1)
     rm -f "\$COUT"
     if [ -n "\$CSID" ]; then
-      case "\$(basename "\$OC")" in
-        opencode2) "\$OC" api delete "/api/session/\$CSID" >/dev/null 2>&1 ;;
-        *)         "\$OC" session delete "\$CSID" >/dev/null 2>&1 ;;
-      esac
+      "\$OC" session delete "\$CSID" >/dev/null 2>&1
     fi
   fi
   # Same aftercare as the review path: push post-curator state when sync is
@@ -484,6 +493,7 @@ trap 'rm -rf "\$GATE" 2>/dev/null' EXIT
 # (fail-safe: a broken binary must not cause an endless retry loop).
 printf '%s:%s\\n' "\$NOW" "\$HASH" > "\$LOCK" 2>/dev/null
 OC="\${AUTOLEARN_HARNESS_BIN:-\${AUTOLEARN_OPENCODE_BIN:-}}"
+if [ -n "\$OC" ] && ! command -v "\$OC" >/dev/null 2>&1; then OC=""; fi
 if [ -z "\$OC" ]; then
   if command -v pi >/dev/null 2>&1; then OC=pi
   elif command -v opencode2 >/dev/null 2>&1; then OC=opencode2
@@ -525,10 +535,9 @@ run_review() {
     grep -E '"type" *: *"(step_finish|step-finish|error)"' "\$OUT" > "\$BASE.run.jsonl" 2>/dev/null
     rm -f "\$OUT"
     if [ -n "\$SID" ]; then
-      case "\$(basename "\$OC")" in
-        opencode2) "\$OC" api delete "/api/session/\$SID" >/dev/null 2>&1 ;;
-        *)         "\$OC" session delete "\$SID" >/dev/null 2>&1 ;;
-      esac
+      # both v1 and v2 ship 'session delete'; the old v2 HTTP form needed
+      # MSYS_NO_PATHCONV, which silently broke the Git Bash shim (cmd //c).
+      "\$OC" session delete "\$SID" >/dev/null 2>>"\$BASE.run.err"
     fi
   fi
   if [ -s "\$BASE.run.err" ]; then
